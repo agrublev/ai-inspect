@@ -47,7 +47,7 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 
 run_step "Install stable Rust and Clippy" \
-  rustup toolchain install stable --profile minimal --component clippy
+  rustup toolchain install stable --profile minimal --component clippy --component rustfmt
 run_step "Select stable Rust as the default toolchain" rustup default stable
 run_step "Fetch locked Cargo dependencies" cargo fetch --locked
 run_step "Build the project" cargo build --locked
