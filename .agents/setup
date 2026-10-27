@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+log_dir="$HOME/.cache/amp/logs"
+mkdir -p "$log_dir"
+exec > >(tee -a "$log_dir/setup.log") 2>&1
+
+run_step() {
+  local label="$1"
+  shift
+  local started=$SECONDS
+
+  printf '\n[%s] START %s\n' "$(date --iso-8601=seconds)" "$label"
+  if "$@"; then
+    printf '[%s] DONE %s (%ss)\n' "$(date --iso-8601=seconds)" "$label" "$((SECONDS - started))"
+  else
+    local status=$?
+    printf '[%s] FAILED %s (%ss, exit %s)\n' \
+      "$(date --iso-8601=seconds)" "$label" "$((SECONDS - started))" "$status"
+    return "$status"
+  fi
+}
+
+missing_packages=()
+for package in build-essential ca-certificates curl; do
+  if ! dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]})); then
+  run_step "Refresh apt package indexes" sudo -n apt-get update
+  run_step "Install Rust build prerequisites" \
+    sudo -n apt-get install -y --no-install-recommends "${missing_packages[@]}"
+else
+  printf '[%s] SKIP Rust build prerequisites already installed\n' "$(date --iso-8601=seconds)"
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+if ! command -v rustup >/dev/null 2>&1; then
+  run_step "Install rustup with stable Rust and Clippy" \
+    bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --component clippy'
+fi
+
+run_step "Install stable Rust and Clippy" \
+  rustup toolchain install stable --profile minimal --component clippy
+run_step "Select stable Rust as the default toolchain" rustup default stable
+run_step "Fetch locked Cargo dependencies" cargo fetch --locked
+run_step "Build the project" cargo build --locked
+run_step "Compile and test the project" cargo test --locked
+run_step "Compile all targets with Clippy" cargo clippy --locked --all-targets -- -D warnings

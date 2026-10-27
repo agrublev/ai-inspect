@@ -1,6 +1,9 @@
 # Rust build output
 /target
 
+# Amp orb portal metadata
+.amp/portals/*
+
 # Backups / editor / OS cruft
 **/*.rs.bk
 *.pdb
