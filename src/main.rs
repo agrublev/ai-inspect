@@ -9,6 +9,7 @@ mod app;
 mod bridge;
 mod cost;
 mod session;
+mod stash;
 mod trace;
 mod ui;
 mod web;

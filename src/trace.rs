@@ -529,6 +529,112 @@ impl TraceStore {
         Ok(())
     }
 
+    /// Ingests normalized events from local agent wrappers.
+    pub fn ingest_external_event(&mut self, event: &Value) -> io::Result<()> {
+        if !event.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trace event must be a JSON object",
+            ));
+        }
+        for field in [
+            "source_id",
+            "session_id",
+            "trace_id",
+            "timestamp",
+            "event_type",
+            "name",
+        ] {
+            if field_str(event, field).is_none_or(str::is_empty) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("trace event requires a non-empty {field}"),
+                ));
+            }
+        }
+        let timestamp = field_str(event, "timestamp").unwrap_or_default();
+        if chrono::DateTime::parse_from_rfc3339(timestamp).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trace event timestamp must be RFC 3339",
+            ));
+        }
+        for field in ["span_id", "parent_span_id", "status"] {
+            if event
+                .get(field)
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("trace event {field} must be a string or null"),
+                ));
+            }
+        }
+        if event
+            .get("metadata")
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trace event metadata must be an object",
+            ));
+        }
+
+        self.append(event.clone())
+    }
+
+    pub fn import_stash_jsonl(&mut self, input: &str) -> io::Result<usize> {
+        let traces = crate::stash::parse_jsonl(input)?;
+        let transaction = self.connection.transaction().map_err(io_error)?;
+        for stash_trace in &traces {
+            let trace_id = format!("stash:{}", stash_trace.id);
+            transaction
+                .execute(
+                    "DELETE FROM evaluations WHERE trace_id=?1",
+                    params![trace_id],
+                )
+                .map_err(io_error)?;
+            transaction
+                .execute("DELETE FROM spans WHERE trace_id=?1", params![trace_id])
+                .map_err(io_error)?;
+            transaction
+                .execute("DELETE FROM events WHERE trace_id=?1", params![trace_id])
+                .map_err(io_error)?;
+            transaction
+                .execute("DELETE FROM traces WHERE trace_id=?1", params![trace_id])
+                .map_err(io_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM current_traces WHERE session_id=?1",
+                    params![trace_id],
+                )
+                .map_err(io_error)?;
+            for event in crate::stash::imported_events(stash_trace) {
+                append_in_transaction(&transaction, &event)?;
+            }
+        }
+        transaction.commit().map_err(io_error)?;
+        Ok(traces.len())
+    }
+
+    pub fn export_stash_jsonl(&self, requested_trace_id: Option<&str>) -> io::Result<String> {
+        let mut traces = self.list_traces()?;
+        if let Some(requested_trace_id) = requested_trace_id {
+            traces.retain(|trace| trace["trace_id"].as_str() == Some(requested_trace_id));
+            if traces.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "trace not found"));
+            }
+        }
+        let mut jsonl = String::new();
+        for trace in traces {
+            let trace_id = trace["trace_id"].as_str().unwrap_or_default();
+            let events = self.events_for_trace(trace_id)?;
+            jsonl.push_str(&crate::stash::export_trace(&trace, &events).to_string());
+            jsonl.push('\n');
+        }
+        Ok(jsonl)
+    }
+
     pub fn list_traces(&self) -> io::Result<Vec<Value>> {
         let mut statement = self
             .connection
@@ -1062,26 +1168,32 @@ impl TraceStore {
     }
 
     fn append(&mut self, event: Value) -> io::Result<()> {
-        let source_id = field_str(&event, "source_id").unwrap_or("");
-        let session_id = field_str(&event, "session_id").unwrap_or("unknown");
-        let trace_id = field_str(&event, "trace_id").unwrap_or("unknown");
-        let timestamp = field_str(&event, "timestamp").unwrap_or("");
-        let event_type = field_str(&event, "event_type").unwrap_or("event");
-        let name = field_str(&event, "name").unwrap_or(event_type);
-        let status = field_str(&event, "status");
-        let event_json = event.to_string();
-        let input_json = json_field(&event, "input")?;
-        let output_json = json_field(&event, "output")?;
-        let metadata_json = event
-            .get("metadata")
-            .cloned()
-            .unwrap_or_else(|| json!({}))
-            .to_string();
-        let span_id = field_str(&event, "span_id");
-        let parent_span_id = field_str(&event, "parent_span_id");
-
         let transaction = self.connection.transaction().map_err(io_error)?;
-        let inserted = transaction
+        append_in_transaction(&transaction, &event)?;
+        transaction.commit().map_err(io_error)
+    }
+}
+
+fn append_in_transaction(transaction: &Transaction<'_>, event: &Value) -> io::Result<()> {
+    let source_id = field_str(event, "source_id").unwrap_or("");
+    let session_id = field_str(event, "session_id").unwrap_or("unknown");
+    let trace_id = field_str(event, "trace_id").unwrap_or("unknown");
+    let timestamp = field_str(event, "timestamp").unwrap_or("");
+    let event_type = field_str(event, "event_type").unwrap_or("event");
+    let name = field_str(event, "name").unwrap_or(event_type);
+    let status = field_str(event, "status");
+    let event_json = event.to_string();
+    let input_json = json_field(event, "input")?;
+    let output_json = json_field(event, "output")?;
+    let metadata_json = event
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let span_id = field_str(event, "span_id");
+    let parent_span_id = field_str(event, "parent_span_id");
+
+    let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO events
                  (source_id,session_id,trace_id,span_id,parent_span_id,timestamp,event_type,name,status,input_json,output_json,metadata_json,event_json)
@@ -1103,11 +1215,10 @@ impl TraceStore {
                 ],
             )
             .map_err(io_error)?;
-        if inserted > 0 {
-            update_projection(&transaction, &event)?;
-        }
-        transaction.commit().map_err(io_error)
+    if inserted > 0 {
+        update_projection(transaction, event)?;
     }
+    Ok(())
 }
 
 fn update_projection(transaction: &Transaction<'_>, event: &Value) -> io::Result<()> {
@@ -1149,13 +1260,21 @@ fn update_projection(transaction: &Transaction<'_>, event: &Value) -> io::Result
         return Ok(());
     };
     let (kind, ended_at, span_status) = match event_type {
+        "model.start" => ("model", None, "running"),
         "model.response" => ("model", Some(timestamp), "ok"),
+        "model.failure" => ("model", Some(timestamp), "error"),
         "tool.start" | "tool.pre" => ("tool", None, "running"),
         "tool.result" | "tool.post" => ("tool", Some(timestamp), "ok"),
         "tool.failure" => ("tool", Some(timestamp), "error"),
+        "tool.async_start" => ("tool", None, "running"),
+        "tool.async_result" => ("tool", Some(timestamp), status),
         "agent.start" => ("agent", None, "running"),
         "agent.end" => ("agent", Some(timestamp), "ok"),
         "agent.prompt" => ("agent", Some(timestamp), "ok"),
+        "agent.tool_turn.start" => ("agent", None, "running"),
+        "agent.tool_turn.end" => ("agent", Some(timestamp), status),
+        "agent.hook.start" => ("hook", None, "running"),
+        "agent.hook.result" => ("hook", Some(timestamp), status),
         _ => return Ok(()),
     };
     transaction
@@ -1545,5 +1664,169 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(average, 1.0);
         assert_eq!(store.evaluations(None).unwrap()[0]["score"], 1.0);
+    }
+
+    #[test]
+    fn external_agent_events_build_trace_and_spans_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let mut events = vec![
+            json!({
+                "source_id":"run-1:0","session_id":"run-1","trace_id":"run-1",
+                "span_id":"run-1","parent_span_id":null,"timestamp":"2026-10-27T10:00:00Z",
+                "event_type":"trace.input","name":"OpenRouter agent run","status":"running",
+                "input":{"input":"find the answer"},"output":null,"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:1","session_id":"run-1","trace_id":"run-1",
+                "span_id":"turn-0","parent_span_id":"run-1","timestamp":"2026-10-27T10:00:01Z",
+                "event_type":"model.start","name":"Model turn 0","status":"running",
+                "input":null,"output":{"type":"turn.start"},"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:2","session_id":"run-1","trace_id":"run-1",
+                "span_id":"call-1","parent_span_id":"turn-0","timestamp":"2026-10-27T10:00:02Z",
+                "event_type":"tool.start","name":"search","status":"running",
+                "input":{"query":"latest release"},"output":null,"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:3","session_id":"run-1","trace_id":"run-1",
+                "span_id":"call-1","parent_span_id":"turn-0","timestamp":"2026-10-27T10:00:03Z",
+                "event_type":"tool.result","name":"search","status":"ok",
+                "input":null,"output":{"items":["release"]},"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:4","session_id":"run-1","trace_id":"run-1",
+                "span_id":"turn-0","parent_span_id":"run-1","timestamp":"2026-10-27T10:00:04Z",
+                "event_type":"model.response","name":"Model turn 0","status":"ok",
+                "input":null,"output":{"text":"v1.2"},"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:5","session_id":"run-1","trace_id":"run-1",
+                "span_id":"hook-5","parent_span_id":"turn-0","timestamp":"2026-10-27T10:00:04Z",
+                "event_type":"agent.hook.start","name":"Hook PostModelCall","status":"running",
+                "input":{"responseId":"response-1"},"output":null,"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:6","session_id":"run-1","trace_id":"run-1",
+                "span_id":"hook-5","parent_span_id":"turn-0","timestamp":"2026-10-27T10:00:04Z",
+                "event_type":"agent.hook.result","name":"Hook PostModelCall","status":"ok",
+                "input":null,"output":{"results":[]},"metadata":{"source":"openrouter-agent"}
+            }),
+            json!({
+                "source_id":"run-1:7","session_id":"run-1","trace_id":"run-1",
+                "span_id":"run-1","parent_span_id":null,"timestamp":"2026-10-27T10:00:05Z",
+                "event_type":"trace.end","name":"OpenRouter agent run","status":"ok",
+                "input":null,"output":{"text":"v1.2"},"metadata":{"source":"openrouter-agent"}
+            }),
+        ];
+        store.ingest_external_event(&events[0]).unwrap();
+        store.ingest_external_event(&events[0]).unwrap();
+        for event in events.drain(1..) {
+            store.ingest_external_event(&event).unwrap();
+        }
+
+        let traces = store.list_traces().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["trace_id"], "run-1");
+        assert_eq!(traces[0]["status"], "ok");
+        assert_eq!(traces[0]["event_count"], 8);
+        let spans = store.spans_for_trace("run-1").unwrap();
+        let model = spans.iter().find(|span| span["kind"] == "model").unwrap();
+        let tool = spans.iter().find(|span| span["kind"] == "tool").unwrap();
+        assert_eq!(model["span_id"], "turn-0");
+        assert_eq!(model["status"], "ok");
+        assert_eq!(tool["span_id"], "call-1");
+        assert_eq!(tool["status"], "ok");
+        assert_eq!(tool["output"]["items"][0], "release");
+        let hook = spans.iter().find(|span| span["kind"] == "hook").unwrap();
+        assert_eq!(hook["span_id"], "hook-5");
+        assert_eq!(hook["status"], "ok");
+    }
+
+    #[test]
+    fn external_agent_event_rejects_invalid_projection_fields() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let invalid = json!({
+            "source_id":"event-1","session_id":"run-1","trace_id":"run-1",
+            "timestamp":"not-a-date","event_type":"trace.input","name":"run",
+            "metadata":{}
+        });
+        assert_eq!(
+            store.ingest_external_event(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(store.list_traces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stash_jsonl_import_round_trips_and_replaces_traces_transactionally() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let original = json!({
+            "id":"refund-1182",
+            "title":"Refund request for order 1182",
+            "metadata":{"agent":"support-bot","model":"qwen3-8b"},
+            "steps":[
+                {"role":"system","content":"You are a support agent."},
+                {"role":"user","content":"I want a refund for order 1182"},
+                {"role":"assistant","content":"","tool_name":"lookup_order","tool_input":{"order_id":"1182"},"tool_call_id":"call_1"},
+                {"role":"tool","content":"{\"status\": \"delivered\"}","tool_name":"lookup_order","tool_call_id":"call_1"},
+                {"role":"assistant","content":"Your order was delivered on May 3."}
+            ]
+        });
+        let input = format!("{}\n", original);
+
+        assert_eq!(store.import_stash_jsonl(&input).unwrap(), 1);
+        let trace_id = "stash:refund-1182";
+        let trace = store.list_traces().unwrap().remove(0);
+        assert_eq!(trace["trace_id"], trace_id);
+        assert_eq!(trace["name"], original["title"]);
+        assert_eq!(trace["event_count"], 9);
+        assert_eq!(store.spans_for_trace(trace_id).unwrap()[0]["kind"], "tool");
+        store
+            .record_evaluation(trace_id, 0.8, "before refresh")
+            .unwrap();
+
+        let exported = store.export_stash_jsonl(Some(trace_id)).unwrap();
+        let round_trip: Value = serde_json::from_str(exported.trim()).unwrap();
+        assert_eq!(round_trip, original);
+
+        let replacement = json!({
+            "id":"refund-1182",
+            "title":"Updated refund request",
+            "steps":[{"role":"user","content":"New question"},{"role":"assistant","content":"New answer"}]
+        });
+        assert_eq!(
+            store
+                .import_stash_jsonl(&format!("{}\n", replacement))
+                .unwrap(),
+            1
+        );
+        let replaced_trace = store.list_traces().unwrap().remove(0);
+        assert_eq!(replaced_trace["name"], "Updated refund request");
+        assert_eq!(replaced_trace["event_count"], 4);
+        assert!(store.spans_for_trace(trace_id).unwrap().is_empty());
+        assert!(store.evaluations(Some(trace_id)).unwrap().is_empty());
+
+        let invalid_batch = format!(
+            "{}\n{}\n",
+            json!({"id":"must-not-partially-import","steps":[{"role":"user","content":"valid"}]}),
+            json!({"id":"invalid","steps":[{"role":"system","content":"only system"}]})
+        );
+        assert_eq!(
+            store.import_stash_jsonl(&invalid_batch).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(store.list_traces().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .export_stash_jsonl(Some(trace_id))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 }

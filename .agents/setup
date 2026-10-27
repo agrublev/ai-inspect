@@ -49,6 +49,17 @@ fi
 run_step "Install stable Rust and Clippy" \
   rustup toolchain install stable --profile minimal --component clippy --component rustfmt
 run_step "Select stable Rust as the default toolchain" rustup default stable
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  printf 'Node.js 20+ and npm are required for openrouter-agent.\n' >&2
+  exit 1
+fi
+node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+if ((node_major < 20)); then
+  printf 'Node.js 20+ is required for openrouter-agent (found major version %s).\n' "$node_major" >&2
+  exit 1
+fi
+run_step "Install locked OpenRouter Agent SDK dependencies" npm ci --prefix openrouter-agent
+run_step "Build and test the OpenRouter wrapper" npm test --prefix openrouter-agent
 run_step "Fetch locked Cargo dependencies" cargo fetch --locked
 run_step "Build the project" cargo build --locked
 run_step "Compile and test the project" cargo test --locked

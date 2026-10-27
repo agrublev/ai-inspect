@@ -1,5 +1,7 @@
 # Rust build output
 /target
+openrouter-agent/node_modules/
+openrouter-agent/dist/
 
 # Amp orb portal metadata
 .amp/portals/*

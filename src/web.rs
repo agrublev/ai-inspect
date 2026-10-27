@@ -16,6 +16,8 @@ const STYLES: &str = include_str!("../web/app.css");
 const RESPONSIVE_STYLES: &str = include_str!("../web/responsive.css");
 const SCRIPT: &str = include_str!("../web/app.js");
 const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+const MAX_TRACE_EVENT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STASH_IMPORT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn run(port: u16, projects_dir: &Path) -> Result<()> {
     let mut store = TraceStore::open(bridge::trace_db_path())
@@ -29,7 +31,7 @@ pub fn run(port: u16, projects_dir: &Path) -> Result<()> {
     println!("Trace data stays local; use Ctrl-C to stop the web UI.");
 
     for mut request in server.incoming_requests() {
-        let response = handle_request(&mut request, &store);
+        let response = handle_request(&mut request, &mut store);
         if let Err(error) = request.respond(response) {
             eprintln!("web UI response failed: {error}");
         }
@@ -55,7 +57,10 @@ fn import_existing_transcripts(store: &mut TraceStore, projects_dir: &Path) -> R
     Ok(())
 }
 
-fn handle_request(request: &mut Request, store: &TraceStore) -> Response<std::io::Cursor<Vec<u8>>> {
+fn handle_request(
+    request: &mut Request,
+    store: &mut TraceStore,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     let method = request.method().clone();
     let url = request.url().to_owned();
     if method != Method::Get {
@@ -69,111 +74,126 @@ fn handle_request(request: &mut Request, store: &TraceStore) -> Response<std::io
         );
     }
 
-    let (status, content_type, body) =
-        match url.split_once('?').map_or(url.as_str(), |(path, _)| path) {
-            "/" => (
-                StatusCode(200),
-                "text/html; charset=utf-8",
-                INDEX.to_owned(),
-            ),
-            "/app.css" => (
-                StatusCode(200),
-                "text/css; charset=utf-8",
-                STYLES.to_owned(),
-            ),
-            "/responsive.css" => (
-                StatusCode(200),
-                "text/css; charset=utf-8",
-                RESPONSIVE_STYLES.to_owned(),
-            ),
-            "/app.js" => (
-                StatusCode(200),
-                "text/javascript; charset=utf-8",
-                SCRIPT.to_owned(),
-            ),
-            "/api/health" => (
+    let (status, content_type, body) = match url
+        .split_once('?')
+        .map_or(url.as_str(), |(path, _)| path)
+    {
+        "/" => (
+            StatusCode(200),
+            "text/html; charset=utf-8",
+            INDEX.to_owned(),
+        ),
+        "/app.css" => (
+            StatusCode(200),
+            "text/css; charset=utf-8",
+            STYLES.to_owned(),
+        ),
+        "/responsive.css" => (
+            StatusCode(200),
+            "text/css; charset=utf-8",
+            RESPONSIVE_STYLES.to_owned(),
+        ),
+        "/app.js" => (
+            StatusCode(200),
+            "text/javascript; charset=utf-8",
+            SCRIPT.to_owned(),
+        ),
+        "/api/health" => (
+            StatusCode(200),
+            "application/json; charset=utf-8",
+            json!({ "ok": true, "storage": "local" }).to_string(),
+        ),
+        "/api/traces/export" => {
+            if query_value(&url, "format").as_deref() != Some("stash") {
+                return json_response(StatusCode(400), json!({ "error": "format must be stash" }));
+            }
+            match store.export_stash_jsonl(query_value(&url, "id").as_deref()) {
+                Ok(jsonl) => (
+                    StatusCode(200),
+                    "application/x-ndjson; charset=utf-8",
+                    jsonl,
+                ),
+                Err(error) => return store_error(error),
+            }
+        }
+        "/api/traces" => match store.list_traces() {
+            Ok(traces) => (
                 StatusCode(200),
                 "application/json; charset=utf-8",
-                json!({ "ok": true, "storage": "local" }).to_string(),
+                json!({ "traces": traces }).to_string(),
             ),
-            "/api/traces" => match store.list_traces() {
-                Ok(traces) => (
-                    StatusCode(200),
-                    "application/json; charset=utf-8",
-                    json!({ "traces": traces }).to_string(),
-                ),
-                Err(error) => api_error(error),
-            },
-            "/api/datasets" => match store.list_datasets() {
-                Ok(datasets) => (
-                    StatusCode(200),
-                    "application/json; charset=utf-8",
-                    json!({ "datasets": datasets }).to_string(),
-                ),
-                Err(error) => api_error(error),
-            },
-            "/api/dataset" => match query_value(&url, "name") {
-                Some(name) => match store.list_datasets() {
-                    Ok(datasets) => {
-                        let dataset = datasets.into_iter().find(|dataset| dataset["name"] == name);
-                        match dataset {
-                            Some(dataset) => match store.dataset_items(&name) {
-                                Ok(items) => (
-                                    StatusCode(200),
-                                    "application/json; charset=utf-8",
-                                    json!({ "dataset": dataset, "items": items }).to_string(),
-                                ),
-                                Err(error) => api_error(error),
-                            },
-                            None => (
-                                StatusCode(404),
+            Err(error) => api_error(error),
+        },
+        "/api/datasets" => match store.list_datasets() {
+            Ok(datasets) => (
+                StatusCode(200),
+                "application/json; charset=utf-8",
+                json!({ "datasets": datasets }).to_string(),
+            ),
+            Err(error) => api_error(error),
+        },
+        "/api/dataset" => match query_value(&url, "name") {
+            Some(name) => match store.list_datasets() {
+                Ok(datasets) => {
+                    let dataset = datasets.into_iter().find(|dataset| dataset["name"] == name);
+                    match dataset {
+                        Some(dataset) => match store.dataset_items(&name) {
+                            Ok(items) => (
+                                StatusCode(200),
                                 "application/json; charset=utf-8",
-                                json!({ "error": "dataset not found" }).to_string(),
+                                json!({ "dataset": dataset, "items": items }).to_string(),
                             ),
-                        }
+                            Err(error) => api_error(error),
+                        },
+                        None => (
+                            StatusCode(404),
+                            "application/json; charset=utf-8",
+                            json!({ "error": "dataset not found" }).to_string(),
+                        ),
                     }
-                    Err(error) => api_error(error),
-                },
-                None => (
-                    StatusCode(400),
-                    "application/json; charset=utf-8",
-                    json!({ "error": "dataset name is required" }).to_string(),
-                ),
+                }
+                Err(error) => api_error(error),
             },
-            "/api/prompts" => match store.list_prompts() {
-                Ok(prompts) => (
+            None => (
+                StatusCode(400),
+                "application/json; charset=utf-8",
+                json!({ "error": "dataset name is required" }).to_string(),
+            ),
+        },
+        "/api/prompts" => match store.list_prompts() {
+            Ok(prompts) => (
+                StatusCode(200),
+                "application/json; charset=utf-8",
+                json!({ "prompts": prompts }).to_string(),
+            ),
+            Err(error) => api_error(error),
+        },
+        "/api/trace" => match query_value(&url, "id") {
+            Some(trace_id) => match trace_detail(store, &trace_id) {
+                Ok(Some(detail)) => (
                     StatusCode(200),
                     "application/json; charset=utf-8",
-                    json!({ "prompts": prompts }).to_string(),
+                    detail.to_string(),
+                ),
+                Ok(None) => (
+                    StatusCode(404),
+                    "application/json; charset=utf-8",
+                    json!({ "error": "trace not found" }).to_string(),
                 ),
                 Err(error) => api_error(error),
             },
-            "/api/trace" => match query_value(&url, "id") {
-                Some(trace_id) => match trace_detail(store, &trace_id) {
-                    Ok(Some(detail)) => (
-                        StatusCode(200),
-                        "application/json; charset=utf-8",
-                        detail.to_string(),
-                    ),
-                    Ok(None) => (
-                        StatusCode(404),
-                        "application/json; charset=utf-8",
-                        json!({ "error": "trace not found" }).to_string(),
-                    ),
-                    Err(error) => api_error(error),
-                },
-                None => (
-                    StatusCode(400),
-                    "application/json; charset=utf-8",
-                    json!({ "error": "trace id is required" }).to_string(),
-                ),
-            },
-            _ => (
-                StatusCode(404),
+            None => (
+                StatusCode(400),
                 "application/json; charset=utf-8",
-                json!({ "error": "not found" }).to_string(),
+                json!({ "error": "trace id is required" }).to_string(),
             ),
-        };
+        },
+        _ => (
+            StatusCode(404),
+            "application/json; charset=utf-8",
+            json!({ "error": "not found" }).to_string(),
+        ),
+    };
     response(status, content_type, body)
 }
 
@@ -181,17 +201,66 @@ fn handle_write_request(
     request: &mut Request,
     method: &Method,
     url: &str,
-    store: &TraceStore,
+    store: &mut TraceStore,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
-    let content_type_is_json = request.headers().iter().any(|header| {
-        header.field.equiv("Content-Type")
-            && header
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let max_body_bytes = match path {
+        "/api/events" => MAX_TRACE_EVENT_BODY_BYTES,
+        "/api/traces/import" => MAX_STASH_IMPORT_BODY_BYTES,
+        _ => MAX_JSON_BODY_BYTES,
+    };
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Type"))
+        .map(|header| {
+            header
                 .value
                 .as_str()
                 .split(';')
                 .next()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-    });
+                .unwrap_or_default()
+                .trim()
+        });
+    if path == "/api/traces/import"
+        && content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/x-ndjson"))
+    {
+        let mut bytes = Vec::new();
+        if let Err(error) = request
+            .as_reader()
+            .take((max_body_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+        {
+            return json_response(
+                StatusCode(400),
+                json!({ "error": format!("could not read Stash import: {error}") }),
+            );
+        }
+        if bytes.len() > max_body_bytes {
+            return json_response(
+                StatusCode(413),
+                json!({ "error": "Stash import exceeds 16 MiB" }),
+            );
+        }
+        let input = match String::from_utf8(bytes) {
+            Ok(input) => input,
+            Err(error) => {
+                return json_response(
+                    StatusCode(400),
+                    json!({ "error": format!("Stash import must be UTF-8: {error}") }),
+                );
+            }
+        };
+        return match store.import_stash_jsonl(&input) {
+            Ok(imported) => json_response(
+                StatusCode(201),
+                json!({ "imported": imported, "format": "stash" }),
+            ),
+            Err(error) => store_error(error),
+        };
+    }
+    let content_type_is_json =
+        content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json"));
     if !content_type_is_json {
         return json_response(
             StatusCode(415),
@@ -200,17 +269,17 @@ fn handle_write_request(
     }
     if request
         .body_length()
-        .is_some_and(|length| length > MAX_JSON_BODY_BYTES)
+        .is_some_and(|length| length > max_body_bytes)
     {
         return json_response(
             StatusCode(413),
-            json!({ "error": "request body exceeds 1 MiB" }),
+            json!({ "error": format!("request body exceeds {} MiB", max_body_bytes / 1024 / 1024) }),
         );
     }
     let mut bytes = Vec::new();
     if let Err(error) = request
         .as_reader()
-        .take((MAX_JSON_BODY_BYTES + 1) as u64)
+        .take((max_body_bytes + 1) as u64)
         .read_to_end(&mut bytes)
     {
         return json_response(
@@ -218,10 +287,10 @@ fn handle_write_request(
             json!({ "error": format!("could not read request body: {error}") }),
         );
     }
-    if bytes.len() > MAX_JSON_BODY_BYTES {
+    if bytes.len() > max_body_bytes {
         return json_response(
             StatusCode(413),
-            json!({ "error": "request body exceeds 1 MiB" }),
+            json!({ "error": format!("request body exceeds {} MiB", max_body_bytes / 1024 / 1024) }),
         );
     }
     let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -246,10 +315,14 @@ fn write_request(
     method: &Method,
     url: &str,
     body: &serde_json::Value,
-    store: &TraceStore,
+    store: &mut TraceStore,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let path = url.split_once('?').map_or(url, |(path, _)| path);
     let result = match (method, path) {
+        (Method::Post, "/api/events") => store
+            .ingest_external_event(body)
+            .map(|()| (StatusCode(201), json!({ "ok": true }))),
+        (Method::Post, "/api/traces/import") => import_stash_traces(body, store),
         (Method::Post, "/api/datasets") => create_dataset(body, store),
         (Method::Put, "/api/dataset") => update_dataset(url, body, store),
         (Method::Post, "/api/dataset-item") => add_dataset_item(url, body, store),
@@ -263,6 +336,33 @@ fn write_request(
         Ok((status, body)) => json_response(status, body),
         Err(error) => store_error(error),
     }
+}
+
+fn import_stash_traces(
+    body: &serde_json::Value,
+    store: &mut TraceStore,
+) -> io::Result<(StatusCode, serde_json::Value)> {
+    let format = required_text(body, "format", "trace format", 32)?;
+    if format != "stash" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "format must be stash",
+        ));
+    }
+    let data = body
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trace data must be a JSONL string",
+            )
+        })?;
+    let imported = store.import_stash_jsonl(data)?;
+    Ok((
+        StatusCode(201),
+        json!({ "imported": imported, "format": "stash" }),
+    ))
 }
 
 fn create_dataset(
@@ -551,12 +651,12 @@ mod tests {
     #[test]
     fn web_writes_create_and_edit_datasets_and_append_prompt_versions() {
         let dir = TempDir::new().unwrap();
-        let store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
         let created = write_request(
             &Method::Post,
             "/api/datasets",
             &json!({ "name": "support", "description": "initial" }),
-            &store,
+            &mut store,
         );
         assert_eq!(created.status_code(), StatusCode(201));
 
@@ -564,7 +664,7 @@ mod tests {
             &Method::Post,
             "/api/datasets",
             &json!({ "name": "support" }),
-            &store,
+            &mut store,
         );
         assert_eq!(duplicate.status_code(), StatusCode(409));
 
@@ -572,7 +672,7 @@ mod tests {
             &Method::Post,
             "/api/dataset-item?name=support",
             &json!({ "input": { "question": "before" }, "expected": "answer" }),
-            &store,
+            &mut store,
         );
         assert_eq!(added.status_code(), StatusCode(201));
         let item_id = store.dataset_items("support").unwrap()[0]["item_id"]
@@ -583,14 +683,14 @@ mod tests {
             &Method::Put,
             "/api/dataset?name=support",
             &json!({ "name": "support-v2", "description": "updated" }),
-            &store,
+            &mut store,
         );
         assert_eq!(renamed.status_code(), StatusCode(200));
         let updated_item = write_request(
             &Method::Put,
             &format!("/api/dataset-item?name=support-v2&id={item_id}"),
             &json!({ "input": { "question": "after" }, "expected": "better answer" }),
-            &store,
+            &mut store,
         );
         assert_eq!(updated_item.status_code(), StatusCode(200));
         let item = store.dataset_items("support-v2").unwrap().remove(0);
@@ -601,14 +701,14 @@ mod tests {
             &Method::Post,
             "/api/prompts",
             &json!({ "name": "helper", "template": " initial\n" }),
-            &store,
+            &mut store,
         );
         assert_eq!(first_version.status_code(), StatusCode(201));
         let second_version = write_request(
             &Method::Post,
             "/api/prompts",
             &json!({ "name": "helper", "template": " revised " }),
-            &store,
+            &mut store,
         );
         assert_eq!(second_version.status_code(), StatusCode(201));
         assert_eq!(
@@ -619,5 +719,72 @@ mod tests {
             store.get_prompt("helper", Some(2)).unwrap().unwrap()["template"],
             " revised "
         );
+    }
+
+    #[test]
+    fn web_ingests_validated_trace_events_for_the_explorer() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let event = json!({
+            "source_id":"openrouter:run:0","session_id":"openrouter:run",
+            "trace_id":"openrouter:run","span_id":"openrouter:run",
+            "parent_span_id":null,"timestamp":"2026-10-27T10:00:00Z",
+            "event_type":"trace.input","name":"OpenRouter agent run","status":"running",
+            "input":{"input":"hello"},"output":null,
+            "metadata":{"source":"openrouter-agent"}
+        });
+
+        let accepted = write_request(&Method::Post, "/api/events", &event, &mut store);
+        assert_eq!(accepted.status_code(), StatusCode(201));
+        let invalid = write_request(
+            &Method::Post,
+            "/api/events",
+            &json!({ "source_id": "missing-required-fields" }),
+            &mut store,
+        );
+        assert_eq!(invalid.status_code(), StatusCode(400));
+        let traces = store.list_traces().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["trace_id"], "openrouter:run");
+    }
+
+    #[test]
+    fn web_imports_and_exports_stash_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let mut store = TraceStore::open(dir.path().join("traces.db")).unwrap();
+        let stash_line = json!({
+            "id":"web-round-trip",
+            "title":"Web format test",
+            "metadata":{"origin":"fixture"},
+            "steps":[
+                {"role":"user","content":"hello"},
+                {"role":"assistant","content":"world"}
+            ]
+        })
+        .to_string();
+        let imported = write_request(
+            &Method::Post,
+            "/api/traces/import",
+            &json!({ "format": "stash", "data": stash_line }),
+            &mut store,
+        );
+        assert_eq!(imported.status_code(), StatusCode(201));
+
+        let exported = store
+            .export_stash_jsonl(Some("stash:web-round-trip"))
+            .unwrap();
+        let round_trip: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+        assert_eq!(round_trip["id"], "web-round-trip");
+        assert_eq!(round_trip["steps"][0]["content"], "hello");
+        assert_eq!(round_trip["steps"][1]["content"], "world");
+
+        let unsupported = write_request(
+            &Method::Post,
+            "/api/traces/import",
+            &json!({ "format": "openai_chat", "data": "{}" }),
+            &mut store,
+        );
+        assert_eq!(unsupported.status_code(), StatusCode(400));
+        assert_eq!(store.list_traces().unwrap().len(), 1);
     }
 }

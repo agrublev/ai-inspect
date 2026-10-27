@@ -50,7 +50,7 @@
             <h1>Trace explorer</h1>
             <p>Inspect every prompt, tool call, result, and agent handoff.</p>
           </div>
-          <div class="heading-actions"><span class="updated-label" id="updated-label">Waiting for local traces…</span><button class="button button-primary" id="refresh-heading" type="button"><span>⟳</span> Refresh</button></div>
+          <div class="heading-actions"><span class="updated-label" id="updated-label">Waiting for local traces…</span><div class="trace-transfer-actions"><input id="stash-import-file" type="file" accept=".jsonl,.ndjson,.json,application/x-ndjson,application/json" hidden><button class="button button-secondary" id="import-stash-button" type="button">Import Stash</button><button class="button button-secondary" id="export-stash-button" type="button">Export Stash</button></div><button class="button button-primary" id="refresh-heading" type="button"><span>⟳</span> Refresh</button></div>
         </section>
 
         <section class="stat-grid" aria-label="Trace overview">
@@ -76,7 +76,7 @@
                 <thead><tr><th>TRACE / INPUT</th><th>STATUS</th><th>EVENTS</th><th>STARTED</th><th></th></tr></thead>
                 <tbody id="trace-rows"><tr><td colspan="5" class="loading-cell"><span class="spinner"></span> Loading local traces…</td></tr></tbody>
               </table>
-              <div class="empty-state" id="empty-state" hidden><div class="empty-icon">◷</div><h3>No traces found</h3><p>Install the Claude Code capture hooks or run <code>iris traces</code> to import existing transcripts.</p></div>
+              <div class="empty-state" id="empty-state" hidden><div class="empty-icon">◷</div><h3>No traces found</h3><p>Install the Claude Code capture hooks, or import a Stash-format JSONL file.</p></div>
             </div>
             <div class="table-footer"><span id="table-summary">—</span><span class="live-indicator"><i></i> Live refresh · 5s</span></div>
           </article>

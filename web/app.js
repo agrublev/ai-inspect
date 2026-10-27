@@ -502,6 +502,56 @@ async function loadTraces(keepSelection = true) {
   }
 }
 
+async function importStashFile(event) {
+  const input = event.currentTarget;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > 16 * 1024 * 1024) {
+    showToast("Stash import must be 16 MiB or smaller");
+    return;
+  }
+  try {
+    const response = await fetch("/api/traces/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-ndjson" },
+      body: await file.text(),
+      cache: "no-store",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Import failed (${response.status})`);
+    showToast(`Imported ${result.imported} Stash trace${result.imported === 1 ? "" : "s"}`);
+    await loadTraces(false);
+  } catch (error) {
+    showToast(error.message || "Could not import Stash traces");
+  }
+}
+
+async function exportStashTraces() {
+  const button = byId("export-stash-button");
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/traces/export?format=stash", { cache: "no-store" });
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.error || `Export failed (${response.status})`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = create("a");
+    link.href = url;
+    link.download = `iris-traces-${new Date().toISOString().slice(0, 10)}.stash.jsonl`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("Exported Stash trace JSONL");
+  } catch (error) {
+    showToast(error.message || "Could not export Stash traces");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderStats() {
   const traces = state.traces;
   const failed = traces.filter((trace) => normalizeStatus(trace.status) === "error").length;
@@ -794,6 +844,9 @@ byId("editor-dialog").addEventListener("close", () => {
 });
 byId("refresh-button").addEventListener("click", () => state.page === "traces" ? loadTraces() : loadLibrary());
 byId("refresh-heading").addEventListener("click", () => loadTraces());
+byId("import-stash-button").addEventListener("click", () => byId("stash-import-file").click());
+byId("stash-import-file").addEventListener("change", importStashFile);
+byId("export-stash-button").addEventListener("click", exportStashTraces);
 byId("copy-trace-id").addEventListener("click", async () => {
   if (!state.detail?.trace?.trace_id) return;
   try {

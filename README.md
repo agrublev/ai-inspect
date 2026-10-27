@@ -1,6 +1,6 @@
 # iris
 
-> Local-first observability for Claude Code: a live terminal supervisor and an interactive trace explorer. **`cargo install iris-tui`** (the binary is `iris`).
+> Local-first observability for Claude Code and the OpenRouter Agent SDK: a live terminal supervisor and an interactive trace explorer. **`cargo install iris-tui`** (the binary is `iris`).
 
 [![crates.io](https://img.shields.io/crates/v/iris-tui?logo=rust&color=e6b800)](https://crates.io/crates/iris-tui)
 [![CI](https://img.shields.io/github/actions/workflow/status/itzenata/iris-tui/ci.yml?branch=main&label=CI)](https://github.com/itzenata/iris-tui/actions/workflows/ci.yml)
@@ -18,7 +18,7 @@ A fast terminal dashboard that watches **all your running Claude Code sessions a
 
 It reads the transcripts Claude Code already writes under `~/.claude/projects/`. **No daemon** is required; install the optional Claude Code hooks to capture lifecycle events and tool boundaries.
 
-**Hard rules:** local-first (the only network call is the AI summary you opt into), read-only over your transcripts, and a heartbeat so sessions never hang waiting on iris.
+**Hard rules:** the Iris app is local-first (only on-demand Anthropic summaries/risk reads make outbound requests), read-only over transcripts, and uses a heartbeat so sessions never hang waiting on Iris. The optional Node wrapper records OpenRouter requests your host app already makes; event forwarding, if enabled, is restricted to loopback.
 
 ![iris supervising two live Claude Code sessions: session list on the left; model, cost, token and tool-call breakdown plus the live activity feed on the right](https://raw.githubusercontent.com/itzenata/iris-tui/main/docs/assets/iris-white.png)
 
@@ -43,9 +43,13 @@ A single live pane, refreshed every second:
 
 **Trace history:** the hooks capture supported prompt, model, tool, instruction, task, and subagent lifecycle events. Transcript events are also normalized into per-turn traces and correlated tool spans. Everything stays in the local SQLite store at `~/.claude/iris/traces.db` (owner-only directory and 0600 database); nothing is uploaded. The full prompts and tool payloads may contain sensitive data, so protect or remove this file as you would the Claude transcripts.
 
+**OpenRouter Agent SDK:** Node apps using [`@openrouter/agent`](https://www.npmjs.com/package/@openrouter/agent) can use the optional [wrapper](./openrouter-agent/README.md) to capture each response-stream event, model turn, tool call/result, async task, lifecycle hook, and aggregate usage. It writes redacted JSONL locally by default and can optionally forward events to the loopback-only web explorer.
+
 Press `t` in the live TUI to browse recent traces, their chronological event timelines, and each event's full JSON payload. `Tab` changes panes; `j`/`k` move through traces and events or scroll the payload.
 
-For a browser-based explorer with a searchable trace table, status and event filters, run summaries, span hierarchy, event payloads, and evaluation scores, run `iris web` and open the local address it prints (`http://127.0.0.1:4318`). The Datasets page can create datasets, rename them, edit descriptions and examples, and add expected outputs. Prompts can be created and revised as immutable versions; older versions remain unchanged. The CLI workflows below remain available. The server imports existing transcripts on startup and refreshes captured hook data every five seconds. It binds to loopback only; the page and assets are served locally with no external fonts, analytics, or telemetry. Prompts, tool payloads, and templates are sensitive, so do not expose the local server beyond a trusted tunnel.
+For a browser-based explorer with a searchable trace table, status and event filters, run summaries, span hierarchy, event payloads, and evaluation scores, run `iris web` and open the local address it prints (`http://127.0.0.1:4318`). The Datasets page can create datasets, rename them, edit descriptions and examples, and add expected outputs. Prompts can be created and revised as immutable versions; older versions remain unchanged. The CLI workflows below remain available. The server imports existing transcripts on startup, refreshes captured hook data every five seconds, and accepts normalized events from the optional OpenRouter wrapper. It binds to loopback only; the page and assets are served locally with no external fonts, analytics, or telemetry. Prompts, tool payloads, and templates are sensitive, so do not expose the local server beyond a trusted tunnel.
+
+**Stash trace interchange:** the Traces page can import and export [Stash Trace Format](https://www.joinstash.ai/docs/trace-format) JSONL. Each line is validated before the batch is stored; re-importing an existing `id` replaces that trace and its evaluations. Imported conversation steps retain their exact fields, including tool-call links. Exports of native Iris traces include reconstructed conversation steps and the original Iris event records in `metadata.iris_events` so richer hook and runtime details are not discarded. This implements Stash's canonical `stash` JSONL format; the other source-specific adapters listed in Stash's documentation (such as OTLP, Langfuse, and Codex) are not yet import formats.
 
 ```bash
 iris traces                               # recent turns, newest first
@@ -72,7 +76,7 @@ Dataset evaluation scores existing captured traces; it does not launch agent run
 ## Hard rules
 
 - **Read-only over your data.** iris tails the transcript files Claude Code writes; it never edits them.
-- **Local-first.** The only outbound request is the AI summary / risk read, and only when you press `s` / `x`. No telemetry, no remote config.
+- **Local-first.** Iris itself makes only on-demand Anthropic summary / risk requests (`s` / `x`). The separate Node wrapper only observes OpenRouter calls initiated by the host app and can deliver trace events to the local Iris server; it sends no remote telemetry.
 - **Never hangs a session.** iris touches a heartbeat file while running. If it's stale (iris not up) or gating is disarmed, the hook instantly defers to Claude Code's normal permission flow, so your sessions are never blocked on a dashboard that isn't there.
 - **Opt-in interception.** Approval gating is off until you arm it with `A`, and it disarms automatically when iris exits.
 - **Your key, your machine.** The Anthropic API key for summaries is entered in-app (`K`) and saved `0600` in your home directory.
@@ -165,6 +169,8 @@ cargo run -- ls           # one-shot table
 cargo test                # heartbeat + transcript parsing tests
 cargo clippy --all-targets -- -D warnings   # CI gates on this
 cargo build --release     # optimized binary (LTO, stripped)
+npm ci --prefix openrouter-agent
+npm test --prefix openrouter-agent
 ```
 
 CI runs clippy (warnings as errors), build, and tests on every push and PR; see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Contribution guidelines live in [CONTRIBUTING.md](./CONTRIBUTING.md).
