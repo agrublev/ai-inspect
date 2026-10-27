@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Iris · Local observability</title>
+    <link rel="stylesheet" href="/app.css">
+    <link rel="stylesheet" href="/responsive.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/" aria-label="Iris home">
+          <span class="brand-mark">i</span>
+          <span class="brand-name">iris<span class="brand-dot">.</span></span>
+        </a>
+        <div class="workspace-switcher">
+          <span class="workspace-icon">L</span>
+          <span class="workspace-copy"><strong>Local workspace</strong><small>Private to this machine</small></span>
+          <span class="chevron">⌄</span>
+        </div>
+        <div class="nav-caption">OBSERVABILITY</div>
+        <nav class="primary-nav" aria-label="Main navigation">
+          <a class="nav-item active" href="#traces" data-page="traces"><span class="nav-icon">◷</span> Traces <span class="nav-count" id="nav-trace-count">—</span></a>
+          <a class="nav-item" href="#datasets" data-page="datasets"><span class="nav-icon">▦</span> Datasets <span class="nav-count" id="nav-dataset-count">—</span></a>
+          <a class="nav-item" href="#prompts" data-page="prompts"><span class="nav-icon">▤</span> Prompts <span class="nav-count" id="nav-prompt-count">—</span></a>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-card"><span class="local-lock">⌑</span><span><strong>Local-first</strong><small>Trace data never leaves here.</small></span></div>
+          <div class="sidebar-version">IRIS TRACE EXPLORER <span>v0.2</span></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Local workspace</span><span class="crumb-slash">/</span><strong id="page-breadcrumb">Traces</strong></div>
+          <div class="topbar-actions">
+            <span class="connection"><i></i> Local database</span>
+            <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh current page" title="Refresh current page">⟳</button>
+            <button class="avatar" type="button" aria-label="Local user">A</button>
+          </div>
+        </header>
+
+        <div id="trace-page">
+        <section class="page-heading">
+          <div>
+            <div class="eyebrow">AGENT OBSERVABILITY</div>
+            <h1>Trace explorer</h1>
+            <p>Inspect every prompt, tool call, result, and agent handoff.</p>
+          </div>
+          <div class="heading-actions"><span class="updated-label" id="updated-label">Waiting for local traces…</span><div class="trace-transfer-actions"><input id="stash-import-file" type="file" accept=".jsonl,.ndjson,.json,application/x-ndjson,application/json" hidden><button class="button button-secondary" id="import-stash-button" type="button">Import Stash</button><button class="button button-secondary" id="export-stash-button" type="button">Export Stash</button></div><button class="button button-primary" id="refresh-heading" type="button"><span>⟳</span> Refresh</button></div>
+        </section>
+
+        <section class="stat-grid" aria-label="Trace overview">
+          <article class="stat-card"><div class="stat-label">TOTAL TRACES <span class="stat-icon purple">◷</span></div><div class="stat-value" id="stat-total">—</div><div class="stat-foot">Captured in this workspace</div></article>
+          <article class="stat-card"><div class="stat-label">FAILED TRACES <span class="stat-icon red">!</span></div><div class="stat-value" id="stat-failed">—</div><div class="stat-foot" id="stat-failed-foot">Requires attention</div></article>
+          <article class="stat-card"><div class="stat-label">RECORDED EVENTS <span class="stat-icon blue">⌁</span></div><div class="stat-value" id="stat-events">—</div><div class="stat-foot">Prompts, tools, and lifecycle</div></article>
+          <article class="stat-card"><div class="stat-label">ACTIVE TRACES <span class="stat-icon green">●</span></div><div class="stat-value" id="stat-active">—</div><div class="stat-foot">Currently in progress</div></article>
+        </section>
+
+        <section class="explorer-layout" aria-label="Trace explorer">
+          <article class="panel trace-panel">
+            <div class="panel-heading">
+              <div><h2>Traces <span class="result-count" id="result-count">0</span></h2><p>Review captured agent runs</p></div>
+              <button class="subtle-button" id="clear-filters" type="button">Clear filters</button>
+            </div>
+            <div class="filters">
+              <label class="search-box"><span aria-hidden="true">⌕</span><input id="search-input" type="search" aria-label="Search traces" placeholder="Search input, trace ID, session…" autocomplete="off"></label>
+              <select id="status-filter" aria-label="Filter by status"><option value="all">All statuses</option><option value="ok">Completed</option><option value="running">Running</option><option value="error">Failed</option></select>
+              <select id="type-filter" aria-label="Filter by event type"><option value="all">All events</option></select>
+            </div>
+            <div class="table-wrap">
+              <table class="trace-table">
+                <thead><tr><th>TRACE / INPUT</th><th>STATUS</th><th>EVENTS</th><th>STARTED</th><th></th></tr></thead>
+                <tbody id="trace-rows"><tr><td colspan="5" class="loading-cell"><span class="spinner"></span> Loading local traces…</td></tr></tbody>
+              </table>
+              <div class="empty-state" id="empty-state" hidden><div class="empty-icon">◷</div><h3>No traces found</h3><p>Install the Claude Code capture hooks, or import a Stash-format JSONL file.</p></div>
+            </div>
+            <div class="table-footer"><span id="table-summary">—</span><span class="live-indicator"><i></i> Live refresh · 5s</span></div>
+          </article>
+
+          <article class="panel detail-panel" id="detail-panel">
+            <div class="detail-empty" id="detail-empty"><div class="empty-icon">⌁</div><h3>Select a trace</h3><p>Choose a run to inspect its timeline, spans, and payloads.</p></div>
+            <div id="detail-content" hidden>
+              <div class="detail-header">
+                <div class="detail-title-row"><div><div class="eyebrow">TRACE DETAILS</div><h2 id="detail-name">Trace</h2></div><span class="status-pill" id="detail-status"></span></div>
+                <div class="trace-id-row"><code id="detail-id"></code><button class="copy-button" id="copy-trace-id" type="button" title="Copy trace ID" aria-label="Copy trace ID">▢</button></div>
+                <div class="detail-meta" id="detail-meta"></div>
+              </div>
+              <div class="detail-tabs" role="tablist" aria-label="Trace detail views">
+                <button class="detail-tab active" data-tab="timeline" role="tab" type="button">Timeline <span id="event-tab-count">0</span></button>
+                <button class="detail-tab" data-tab="spans" role="tab" type="button">Spans <span id="span-tab-count">0</span></button>
+                <button class="detail-tab" data-tab="json" role="tab" type="button">JSON</button>
+              </div>
+              <div class="detail-body" id="detail-body"></div>
+            </div>
+          </article>
+        </section>
+        <footer class="page-footer"><span>IRIS · LOCAL AGENT OBSERVABILITY</span><span>Prompts and tool payloads can contain sensitive data.</span></footer>
+        </div>
+
+        <div class="library-page" id="library-page" hidden>
+          <section class="page-heading">
+            <div>
+              <div class="eyebrow" id="library-eyebrow">LOCAL WORKSPACE</div>
+              <h1 id="library-title">Datasets</h1>
+              <p id="library-description">Browse evaluation examples and expected outputs.</p>
+            </div>
+            <div class="heading-actions"><span class="updated-label" id="library-updated">Loading local data…</span><button class="button button-primary" id="library-create-button" type="button">Create dataset</button></div>
+          </section>
+          <section class="library-layout" aria-label="Local datasets and prompt versions">
+            <article class="panel library-list-panel">
+              <div class="panel-heading">
+                <div><h2 id="library-list-title">Datasets <span class="result-count" id="library-count">0</span></h2><p id="library-list-description">Evaluation inputs and expected outputs</p></div>
+              </div>
+              <label class="search-box library-search"><span aria-hidden="true">⌕</span><input id="library-search" type="search" aria-label="Search datasets" placeholder="Search local data…" autocomplete="off"></label>
+              <div class="library-list" id="library-rows"></div>
+              <div class="library-empty" id="library-empty" hidden><div class="empty-icon">▦</div><h3 id="library-empty-title">No datasets yet</h3><p id="library-empty-copy">Create a dataset with the iris CLI to browse it here.</p></div>
+              <div class="table-footer"><span id="library-summary">—</span><span class="live-indicator"><i></i> Stored locally</span></div>
+            </article>
+            <article class="panel library-detail-panel" id="library-detail-panel">
+              <div class="detail-empty" id="library-detail-empty"><div class="empty-icon">▤</div><h3 id="library-detail-empty-title">Select an item</h3><p id="library-detail-empty-copy">Choose a dataset or prompt version to inspect its contents.</p></div>
+              <div class="library-detail-content" id="library-detail-content" hidden></div>
+            </article>
+          </section>
+          <footer class="page-footer"><span>IRIS · LOCAL AGENT OBSERVABILITY</span><span>Dataset examples and prompt templates stay on this machine.</span></footer>
+        </div>
+      </main>
+    </div>
+    <dialog class="editor-dialog" id="editor-dialog" aria-labelledby="editor-title">
+      <form id="editor-form">
+        <div class="editor-heading">
+          <div><div class="eyebrow" id="editor-eyebrow">LOCAL WORKSPACE</div><h2 id="editor-title">Create dataset</h2></div>
+          <button class="icon-button editor-close" id="editor-close" type="button" aria-label="Close editor">×</button>
+        </div>
+        <p class="editor-description" id="editor-help"></p>
+        <div class="editor-fields" id="editor-fields"></div>
+        <div class="editor-error" id="editor-error" role="alert" hidden></div>
+        <div class="editor-actions"><button class="button button-secondary" id="editor-cancel" type="button">Cancel</button><button class="button button-primary" id="editor-save" type="submit">Save</button></div>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

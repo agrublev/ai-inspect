@@ -10,16 +10,25 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::widgets::ListState;
+use serde_json::Value;
 
 use crate::anthropic;
 use crate::bridge::{self, Pending};
 use crate::session::{discover, Session, Status};
+use crate::trace::TraceStore;
 
 /// State of an AI summary for one session.
 pub enum SummaryState {
     Loading,
     Done(String),
     Error(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TracePane {
+    Traces,
+    Events,
+    Payload,
 }
 
 fn key_file() -> PathBuf {
@@ -35,7 +44,12 @@ fn hidden_file() -> PathBuf {
 /// records which ones iris should skip rendering.
 fn load_hidden() -> HashSet<PathBuf> {
     std::fs::read_to_string(hidden_file())
-        .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -52,7 +66,10 @@ fn save_hidden(hidden: &HashSet<PathBuf>) {
 
 /// Resolve the API key: `ANTHROPIC_API_KEY` wins, else the saved key file.
 fn load_api_key() -> Option<String> {
-    if let Some(k) = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(k) = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+    {
         return Some(k);
     }
     std::fs::read_to_string(key_file())
@@ -108,10 +125,31 @@ enum SelKey {
 /// one line instead of flooding the list.
 const GROUP_AUTOCOLLAPSE: usize = 4;
 
+fn moved_index(current: usize, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    Some(if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(last)
+    })
+}
+
 pub struct App {
     pub projects_dir: PathBuf,
     pub window: Duration,
     pub interval: Duration,
+    trace_store: Option<TraceStore>,
+    pub trace_browser_open: bool,
+    pub trace_pane: TracePane,
+    pub trace_rows: Vec<Value>,
+    pub trace_selected: usize,
+    pub trace_events: Vec<Value>,
+    pub trace_event_selected: usize,
+    trace_payload_scroll: Cell<u16>,
+    trace_payload_max_scroll: Cell<u16>,
 
     readers: HashMap<PathBuf, Session>,
     /// Paths of currently active sessions in grouped priority order (flat).
@@ -191,6 +229,15 @@ impl App {
             projects_dir,
             window,
             interval,
+            trace_store: None,
+            trace_browser_open: false,
+            trace_pane: TracePane::Traces,
+            trace_rows: Vec::new(),
+            trace_selected: 0,
+            trace_events: Vec::new(),
+            trace_event_selected: 0,
+            trace_payload_scroll: Cell::new(0),
+            trace_payload_max_scroll: Cell::new(0),
             readers: HashMap::new(),
             visible: Vec::new(),
             rows: Vec::new(),
@@ -257,24 +304,168 @@ impl App {
         self.install_open = false;
     }
 
-    /// Accept the proposal: register the hook so iris intercepts approvals.
+    pub fn open_trace_browser(&mut self) {
+        if self.trace_store.is_none() {
+            match TraceStore::open(bridge::trace_db_path()) {
+                Ok(store) => self.trace_store = Some(store),
+                Err(error) => {
+                    self.flash = Some(format!("trace explorer unavailable: {error}"));
+                    return;
+                }
+            }
+        }
+        self.trace_browser_open = true;
+        self.trace_pane = TracePane::Traces;
+        self.refresh_trace_browser();
+    }
+
+    pub fn close_trace_browser(&mut self) {
+        self.trace_browser_open = false;
+        self.pending_g = false;
+    }
+
+    pub fn trace_browser_focus(&mut self, backwards: bool) {
+        self.trace_pane = match (self.trace_pane, backwards) {
+            (TracePane::Traces, false) | (TracePane::Payload, true) => TracePane::Events,
+            (TracePane::Events, false) | (TracePane::Traces, true) => TracePane::Payload,
+            (TracePane::Payload, false) | (TracePane::Events, true) => TracePane::Traces,
+        };
+    }
+
+    pub fn trace_browser_activate(&mut self) {
+        self.trace_browser_focus(false);
+    }
+
+    pub fn trace_browser_move(&mut self, delta: isize) {
+        match self.trace_pane {
+            TracePane::Traces => {
+                let Some(next) = moved_index(self.trace_selected, self.trace_rows.len(), delta)
+                else {
+                    return;
+                };
+                if next != self.trace_selected {
+                    self.trace_selected = next;
+                    self.load_trace_events(true);
+                }
+            }
+            TracePane::Events => {
+                if let Some(next) =
+                    moved_index(self.trace_event_selected, self.trace_events.len(), delta)
+                {
+                    self.trace_event_selected = next;
+                    self.trace_payload_scroll.set(0);
+                }
+            }
+            TracePane::Payload => {
+                let offset = (i32::from(self.trace_payload_scroll.get()) + (delta * 3) as i32)
+                    .clamp(0, i32::from(self.trace_payload_max_scroll.get()))
+                    as u16;
+                self.trace_payload_scroll.set(offset);
+            }
+        }
+    }
+
+    pub fn trace_browser_page(&mut self, pages: isize) {
+        match self.trace_pane {
+            TracePane::Traces => self.trace_browser_move(pages * 5),
+            TracePane::Events => self.trace_browser_move(pages * 5),
+            TracePane::Payload => {
+                let offset = (i32::from(self.trace_payload_scroll.get()) + (pages * 12) as i32)
+                    .clamp(0, i32::from(self.trace_payload_max_scroll.get()))
+                    as u16;
+                self.trace_payload_scroll.set(offset);
+            }
+        }
+    }
+
+    pub fn trace_payload_scroll(&self) -> u16 {
+        self.trace_payload_scroll.get()
+    }
+
+    pub fn set_trace_payload_max_scroll(&self, max_scroll: u16) {
+        self.trace_payload_max_scroll.set(max_scroll);
+        self.trace_payload_scroll
+            .set(self.trace_payload_scroll.get().min(max_scroll));
+    }
+
+    pub fn refresh_trace_browser(&mut self) {
+        let selected_id = self
+            .trace_rows
+            .get(self.trace_selected)
+            .and_then(|trace| trace["trace_id"].as_str())
+            .map(str::to_owned);
+        let traces = match self.trace_store.as_ref().map(TraceStore::list_traces) {
+            Some(Ok(traces)) => traces,
+            Some(Err(error)) => {
+                self.flash = Some(format!("trace refresh failed: {error}"));
+                return;
+            }
+            None => return,
+        };
+        self.trace_rows = traces;
+        self.trace_selected = selected_id
+            .and_then(|id| {
+                self.trace_rows
+                    .iter()
+                    .position(|trace| trace["trace_id"].as_str() == Some(id.as_str()))
+            })
+            .unwrap_or_else(|| {
+                self.trace_selected
+                    .min(self.trace_rows.len().saturating_sub(1))
+            });
+        self.load_trace_events(false);
+    }
+
+    pub fn selected_trace_event(&self) -> Option<&Value> {
+        self.trace_events.get(self.trace_event_selected)
+    }
+
+    fn load_trace_events(&mut self, reset_selection: bool) {
+        let trace_id = self
+            .trace_rows
+            .get(self.trace_selected)
+            .and_then(|trace| trace["trace_id"].as_str())
+            .map(str::to_owned);
+        let events = match (self.trace_store.as_ref(), trace_id.as_deref()) {
+            (Some(store), Some(trace_id)) => match store.events_for_trace(trace_id) {
+                Ok(events) => events,
+                Err(error) => {
+                    self.flash = Some(format!("trace detail unavailable: {error}"));
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
+        self.trace_events = events;
+        if reset_selection {
+            self.trace_event_selected = 0;
+            self.trace_payload_scroll.set(0);
+        } else {
+            self.trace_event_selected = self
+                .trace_event_selected
+                .min(self.trace_events.len().saturating_sub(1));
+        }
+    }
+
+    /// Install trace capture and the opt-in approval hook.
     pub fn enable_approvals(&mut self) {
         match bridge::install_hook(false) {
             Ok(_) => {
                 self.hook_installed = true;
-                self.flash = Some("approvals ON — restart Claude sessions to arm it".into());
+                self.flash =
+                    Some("trace capture ON — restart Claude sessions to record events".into());
             }
             Err(e) => self.flash = Some(format!("enable failed: {e}")),
         }
         self.install_open = false;
     }
 
-    /// Remove the hook so iris no longer intercepts other sessions.
+    /// Remove all Iris lifecycle hooks from Claude Code settings.
     pub fn disable_approvals(&mut self) {
         match bridge::uninstall_hook(false) {
             Ok(_) => {
                 self.hook_installed = false;
-                self.flash = Some("approvals OFF — iris no longer intercepts sessions".into());
+                self.flash = Some("trace capture OFF — Iris hooks removed".into());
             }
             Err(e) => self.flash = Some(format!("disable failed: {e}")),
         }
@@ -522,12 +713,46 @@ RISK: low|medium|high",
             self.last_pending_logged = self.pending.len();
         }
 
+        if self.hook_installed && self.trace_store.is_none() {
+            match TraceStore::open(bridge::trace_db_path()) {
+                Ok(store) => self.trace_store = Some(store),
+                Err(error) => self.flash = Some(format!("trace capture unavailable: {error}")),
+            }
+        }
+
         for path in discover(&self.projects_dir) {
-            let s = self
-                .readers
-                .entry(path.clone())
-                .or_insert_with(|| Session::new(path.clone()));
-            let _ = s.refresh();
+            let records = {
+                let s = self
+                    .readers
+                    .entry(path.clone())
+                    .or_insert_with(|| Session::new(path.clone()));
+                let _ = s.refresh();
+                s.take_new_records()
+            };
+            let mut retry_records = None;
+            if self.hook_installed {
+                if let Some(store) = self.trace_store.as_mut() {
+                    let mut pending = records.into_iter();
+                    while let Some(record) = pending.next() {
+                        if let Err(error) = store.ingest_transcript(record.clone()) {
+                            self.flash = Some(format!("trace capture failed: {error}"));
+                            let mut retry = vec![record];
+                            // The failed source is retried too; SQLite's unique
+                            // source key makes a post-commit error harmless.
+                            retry.extend(pending);
+                            retry_records = Some(retry);
+                            break;
+                        }
+                    }
+                } else if !records.is_empty() {
+                    retry_records = Some(records);
+                }
+            }
+            if let Some(records) = retry_records {
+                if let Some(reader) = self.readers.get_mut(&path) {
+                    reader.restore_new_records(records);
+                }
+            }
         }
 
         // Annotate every reader with bridge state so status() is precise: a live
@@ -556,14 +781,14 @@ RISK: low|medium|high",
             .collect();
         // Sort: live hook approvals first, then by status, then most recent.
         let rank = |s: &Session| -> (u8, u8) {
-            let pend = if self.pending.contains_key(&s.id) { 0 } else { 1 };
+            let pend = if self.pending.contains_key(&s.id) {
+                0
+            } else {
+                1
+            };
             (pend, s.status().rank())
         };
-        active.sort_by(|a, b| {
-            rank(a)
-                .cmp(&rank(b))
-                .then(b.mtime.cmp(&a.mtime))
-        });
+        active.sort_by(|a, b| rank(a).cmp(&rank(b)).then(b.mtime.cmp(&a.mtime)));
         self.visible = active.iter().map(|s| s.path.clone()).collect();
 
         self.regroup();
@@ -573,6 +798,9 @@ RISK: low|medium|high",
         if self.focused && self.feed_follow {
             let last = self.feed_len().saturating_sub(1);
             self.feed_state.borrow_mut().select(Some(last));
+        }
+        if self.trace_browser_open {
+            self.refresh_trace_browser();
         }
     }
 
@@ -761,7 +989,11 @@ RISK: low|medium|high",
             .iter()
             .filter_map(|p| self.readers.get(p))
             .filter(|s| s.project() == key)
-            .filter_map(|s| self.pending.get(&s.id).map(|p| (s.id.clone(), p.id.clone())))
+            .filter_map(|s| {
+                self.pending
+                    .get(&s.id)
+                    .map(|p| (s.id.clone(), p.id.clone()))
+            })
             .collect();
         if targets.is_empty() {
             self.flash = Some(format!("no pending approvals in {key}"));
@@ -810,7 +1042,9 @@ RISK: low|medium|high",
     /// this only hides it from view (persisted across refreshes), the transcript
     /// `.jsonl` file is never touched.
     pub fn hide_selected(&mut self) {
-        let Some(path) = self.selected_path() else { return };
+        let Some(path) = self.selected_path() else {
+            return;
+        };
         self.hidden.insert(path.clone());
         save_hidden(&self.hidden);
         self.flash = Some("session removed from view (transcript on disk untouched)".into());

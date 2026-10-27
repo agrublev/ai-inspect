@@ -9,7 +9,10 @@ mod app;
 mod bridge;
 mod cost;
 mod session;
+mod stash;
+mod trace;
 mod ui;
+mod web;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +27,12 @@ struct Args {
     interval: Duration,
     dir: Option<PathBuf>,
     list_once: bool,
+    traces: bool,
+    web: bool,
+    port: u16,
+    trace_id: Option<String>,
+    search: Option<String>,
+    management: Option<Vec<String>>,
     hook: bool,
     install_hook: bool,
     uninstall_hook: bool,
@@ -38,11 +47,19 @@ USAGE:
 
 COMMANDS:
     ls            Print a one-shot table of active sessions and exit
-    install-hook  Register `iris hook` as a PreToolUse hook in settings.json
-                  so approvals route through iris. --project for ./.claude.
-    uninstall-hook  Remove the iris PreToolUse hook from settings.json.
-    hook          PreToolUse hook bridge — reads a tool request on stdin and
-                  routes the approve/deny decision through the iris TUI.
+    traces        List saved traces, newest first
+    trace <ID>    Show the event timeline and full payloads for a trace
+    web           Open the local web trace explorer
+    search <TEXT> Search captured event data
+    dataset list | create <NAME> [DESCRIPTION] | add <NAME> <INPUT_JSON> [EXPECTED_JSON]
+    dataset items <NAME>  Show examples in a local evaluation dataset
+    prompt list | save <NAME> <TEMPLATE> | show <NAME> [VERSION]
+    eval run <DATASET> [exact|contains]  Score saved traces against expectations
+    eval <TRACE_ID> <SCORE> [REASON]  Add a manual 0..1 evaluation score
+    evals [TRACE_ID]  List evaluation scores
+    install-hook  Register trace lifecycle hooks (and optional approval hook)
+    uninstall-hook  Remove the iris lifecycle hooks from settings.json.
+    hook          Hook event recorder and PreToolUse approval bridge.
                   Register it in settings.json, not run by hand.
     (default)     Launch the live TUI dashboard
 
@@ -51,6 +68,7 @@ OPTIONS:
                             (sessions waiting for approval stay shown regardless)
     -i, --interval <SEC>    Data refresh interval in seconds [default: 1]
     -d, --dir <PATH>        Override the projects directory [default: ~/.claude/projects]
+    -p, --port <PORT>       Web UI port [default: 4318; binds to 127.0.0.1]
     -h, --help              Show this help
 ";
 
@@ -60,6 +78,12 @@ fn parse_args() -> Result<Args> {
         interval: Duration::from_secs(1),
         dir: None,
         list_once: false,
+        traces: false,
+        web: false,
+        port: 4318,
+        trace_id: None,
+        search: None,
+        management: None,
         hook: false,
         install_hook: false,
         uninstall_hook: false,
@@ -73,6 +97,16 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             "ls" | "list" => a.list_once = true,
+            "traces" => a.traces = true,
+            "web" => a.web = true,
+            "trace" => a.trace_id = Some(it.next().context("trace needs an ID")?),
+            "search" => a.search = Some(it.next().context("search needs text")?),
+            "dataset" | "prompt" | "eval" | "evals" => {
+                let mut command = vec![arg];
+                command.extend(it);
+                a.management = Some(command);
+                break;
+            }
             "hook" => a.hook = true,
             "install-hook" => a.install_hook = true,
             "uninstall-hook" => a.uninstall_hook = true,
@@ -84,6 +118,9 @@ fn parse_args() -> Result<Args> {
             "-i" | "--interval" => {
                 let v: u64 = it.next().context("--interval needs a value")?.parse()?;
                 a.interval = Duration::from_secs(v.max(1));
+            }
+            "-p" | "--port" => {
+                a.port = it.next().context("--port needs a value")?.parse()?;
             }
             "-d" | "--dir" => {
                 a.dir = Some(PathBuf::from(it.next().context("--dir needs a value")?));
@@ -132,6 +169,39 @@ fn main() -> Result<()> {
     }
 
     let dir = projects_dir(args.dir.take())?;
+    if args.web {
+        web::run(args.port, &dir)?;
+        return Ok(());
+    }
+    if args.traces || args.trace_id.is_some() || args.search.is_some() || args.management.is_some()
+    {
+        let mut store = trace::TraceStore::open(bridge::trace_db_path())?;
+        if dir.exists() {
+            for path in session::discover(&dir) {
+                let mut reader = session::Session::new(path);
+                reader.refresh()?;
+                for record in reader.take_new_records() {
+                    store.ingest_transcript(record)?;
+                }
+            }
+        }
+        if let Some(command) = args.management {
+            run_management(&store, &command)?;
+        } else if let Some(query) = args.search {
+            print_events(store.search(&query)?);
+        } else if let Some(requested_id) = args.trace_id {
+            let trace_id = store
+                .list_traces()?
+                .into_iter()
+                .filter_map(|trace| trace["trace_id"].as_str().map(str::to_owned))
+                .find(|trace_id| trace_id.starts_with(&requested_id))
+                .with_context(|| format!("no trace found matching {requested_id}"))?;
+            print_events(store.events_for_trace(&trace_id)?);
+        } else {
+            print_traces(store.list_traces()?);
+        }
+        return Ok(());
+    }
     if !dir.exists() {
         anyhow::bail!("projects directory not found: {}", dir.display());
     }
@@ -144,6 +214,192 @@ fn main() -> Result<()> {
     }
 
     run_tui(app)
+}
+
+fn run_management(store: &trace::TraceStore, command: &[String]) -> Result<()> {
+    let verb = command.first().map(String::as_str).unwrap_or("");
+    match verb {
+        "dataset" => match command.get(1).map(String::as_str).unwrap_or("list") {
+            "list" => {
+                for dataset in store.list_datasets()? {
+                    println!(
+                        "{}  {} items  {}",
+                        dataset["name"].as_str().unwrap_or(""),
+                        dataset["items"].as_u64().unwrap_or(0),
+                        dataset["description"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            "create" => {
+                let name = command.get(2).context("dataset create needs a name")?;
+                let description = command.get(3).map(String::as_str).unwrap_or("");
+                store.create_dataset(name, description)?;
+                println!("saved dataset {name}");
+            }
+            "add" => {
+                let name = command.get(2).context("dataset add needs a name")?;
+                let input: serde_json::Value =
+                    serde_json::from_str(command.get(3).context("dataset add needs input JSON")?)?;
+                let expected = command
+                    .get(4)
+                    .map(|value| serde_json::from_str(value))
+                    .transpose()?;
+                store.add_dataset_item(name, &input, expected.as_ref())?;
+                println!("added example to {name}");
+            }
+            "items" => {
+                let name = command.get(2).context("dataset items needs a name")?;
+                for item in store.dataset_items(name)? {
+                    println!("{}", serde_json::to_string_pretty(&item)?);
+                }
+            }
+            other => anyhow::bail!("unknown dataset command: {other}"),
+        },
+        "prompt" => match command.get(1).map(String::as_str).unwrap_or("list") {
+            "list" => {
+                for prompt in store.list_prompts()? {
+                    println!(
+                        "{} v{}  {}",
+                        prompt["name"].as_str().unwrap_or(""),
+                        prompt["version"].as_u64().unwrap_or(0),
+                        truncate(prompt["template"].as_str().unwrap_or(""), 100)
+                    );
+                }
+            }
+            "save" => {
+                let name = command.get(2).context("prompt save needs a name")?;
+                let template = command.get(3).context("prompt save needs a template")?;
+                let version = store.save_prompt(name, template)?;
+                println!("saved {name} v{version}");
+            }
+            "show" => {
+                let name = command.get(2).context("prompt show needs a name")?;
+                let version = command.get(3).map(|value| value.parse()).transpose()?;
+                let prompt = store
+                    .get_prompt(name, version)?
+                    .with_context(|| format!("prompt not found: {name}"))?;
+                println!("{}", serde_json::to_string_pretty(&prompt)?);
+            }
+            other => anyhow::bail!("unknown prompt command: {other}"),
+        },
+        "eval" => {
+            if command.get(1).map(String::as_str) == Some("run") {
+                let dataset = command.get(2).context("eval run needs a dataset name")?;
+                let scorer = command.get(3).map(String::as_str).unwrap_or("exact");
+                let (count, average) = store.evaluate_dataset(dataset, scorer)?;
+                println!("scored {count} examples with {scorer}; average score {average:.3}");
+                return Ok(());
+            }
+            let requested_id = command.get(1).context("eval needs a trace ID")?;
+            let score: f64 = command
+                .get(2)
+                .context("eval needs a score between 0 and 1")?
+                .parse()?;
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&score),
+                "score must be between 0 and 1"
+            );
+            let trace_id = resolve_trace_id(store, requested_id)?;
+            let reason = command.get(3).map(String::as_str).unwrap_or("");
+            store.record_evaluation(&trace_id, score, reason)?;
+            println!("recorded score {score:.2} for {trace_id}");
+        }
+        "evals" => {
+            let trace_id = command
+                .get(1)
+                .map(|value| resolve_trace_id(store, value))
+                .transpose()?;
+            for evaluation in store.evaluations(trace_id.as_deref())? {
+                println!("{}", serde_json::to_string_pretty(&evaluation)?);
+            }
+        }
+        _ => anyhow::bail!("unknown local management command: {verb}"),
+    }
+    Ok(())
+}
+
+fn resolve_trace_id(store: &trace::TraceStore, requested: &str) -> Result<String> {
+    store
+        .list_traces()?
+        .into_iter()
+        .filter_map(|trace| trace["trace_id"].as_str().map(str::to_owned))
+        .find(|trace_id| trace_id.starts_with(requested))
+        .with_context(|| format!("no trace found matching {requested}"))
+}
+
+fn print_traces(traces: Vec<serde_json::Value>) {
+    if traces.is_empty() {
+        println!("no traces recorded yet (start iris and install the Claude Code hooks)");
+        return;
+    }
+    println!(
+        "{:<18} {:<18} {:<25} {:>7}  INPUT",
+        "TRACE", "SESSION", "STARTED", "EVENTS"
+    );
+    for trace in traces {
+        let id = trace["trace_id"].as_str().unwrap_or("");
+        let session = trace["session_id"].as_str().unwrap_or("");
+        let started = trace["started_at"].as_str().unwrap_or("");
+        let input = brief(&trace["input"]);
+        println!(
+            "{:<18} {:<18} {:<25} {:>7}  {}",
+            truncate(id, 16),
+            truncate(session, 16),
+            truncate(started, 24),
+            trace["event_count"].as_u64().unwrap_or(0),
+            input
+        );
+    }
+}
+
+fn print_events(events: Vec<serde_json::Value>) {
+    if events.is_empty() {
+        println!("no matching trace events");
+        return;
+    }
+    for event in events {
+        let span_id = event["span_id"].as_str().unwrap_or("");
+        let parent_span_id = event["parent_span_id"].as_str().unwrap_or("");
+        let relation = match (span_id.is_empty(), parent_span_id.is_empty()) {
+            (false, false) => format!(
+                " span={} parent={}",
+                truncate(span_id, 12),
+                truncate(parent_span_id, 12)
+            ),
+            (false, true) => format!(" span={}", truncate(span_id, 12)),
+            (true, false) => format!(" parent={}", truncate(parent_span_id, 12)),
+            (true, true) => String::new(),
+        };
+        println!(
+            "{}  {}  {}  [{}]{}",
+            event["timestamp"].as_str().unwrap_or(""),
+            event["event_type"].as_str().unwrap_or("event"),
+            event["name"].as_str().unwrap_or(""),
+            event["status"].as_str().unwrap_or("?"),
+            relation
+        );
+        for field in ["input", "output", "metadata"] {
+            if !event[field].is_null() {
+                let body = serde_json::to_string_pretty(&event[field]).unwrap_or_default();
+                println!("  {field}:\n{}", indent(&body, "    "));
+            }
+        }
+    }
+}
+
+fn brief(value: &serde_json::Value) -> String {
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    truncate(&text.replace('\n', " "), 80)
+}
+
+fn indent(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_list(app: &App) {
@@ -266,6 +522,22 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         KeyCode::Char('q') => break,
                         _ => {}
                     }
+                } else if app.trace_browser_open {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Char('q') => app.close_trace_browser(),
+                        KeyCode::Tab => app.trace_browser_focus(false),
+                        KeyCode::BackTab => app.trace_browser_focus(true),
+                        KeyCode::Enter => app.trace_browser_activate(),
+                        KeyCode::Char('j') | KeyCode::Down => app.trace_browser_move(1),
+                        KeyCode::Char('k') | KeyCode::Up => app.trace_browser_move(-1),
+                        KeyCode::PageDown => app.trace_browser_page(1),
+                        KeyCode::PageUp => app.trace_browser_page(-1),
+                        KeyCode::Char('d') if ctrl => app.trace_browser_page(1),
+                        KeyCode::Char('u') if ctrl => app.trace_browser_page(-1),
+                        KeyCode::Char('r') => app.refresh(),
+                        _ => {}
+                    }
                 } else if app.focused {
                     // Scroll mode: vim motions drive the activity feed of the
                     // entered session. Esc/h leaves; a/d/s still act on it.
@@ -292,6 +564,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         KeyCode::Home => app.feed_top(),
                         KeyCode::Char('G') | KeyCode::End => app.feed_bottom(),
                         KeyCode::Char('s') => app.open_summary(),
+                        KeyCode::Char('t') => app.open_trace_browser(),
                         KeyCode::Char('a') => app.approve_selected(true),
                         KeyCode::Char('d') => app.approve_selected(false),
                         KeyCode::Char('r') => app.refresh(),
@@ -350,6 +623,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                         KeyCode::Char(' ') => app.toggle_selected_group(),
                         KeyCode::Char('z') => app.toggle_all_groups(),
                         KeyCode::Char('i') => app.open_install(),
+                        KeyCode::Char('t') => app.open_trace_browser(),
                         KeyCode::Char('A') => app.toggle_gating(),
                         KeyCode::Char('K') => app.start_key_input(),
                         _ => {}

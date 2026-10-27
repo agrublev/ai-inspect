@@ -1,0 +1,31 @@
+{
+  "name": "iris-openrouter-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local trace capture for the OpenRouter Agent SDK",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@openrouter/agent": "0.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "typescript": "5.8.3"
+  }
+}

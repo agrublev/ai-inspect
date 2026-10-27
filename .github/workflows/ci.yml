@@ -15,6 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: openrouter-agent/package-lock.json
+
+      - name: Install Node dependencies
+        run: npm ci --prefix openrouter-agent
+
+      - name: Test OpenRouter wrapper
+        run: npm test --prefix openrouter-agent
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:

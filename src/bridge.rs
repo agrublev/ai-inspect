@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::trace::TraceStore;
+
 /// Heartbeat older than this ⇒ treat iris as not running.
 const HEARTBEAT_STALE_SECS: u64 = 8;
 /// Max time the hook will wait for a decision before deferring to "ask".
@@ -27,6 +29,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// file. Either way iris can no longer act on it, so we GC it rather than show a
 /// phantom "needs approval" forever. Kept a hair above POLL_TIMEOUT.
 const REQUEST_STALE_SECS: u64 = 30;
+/// Passive lifecycle events that make transcript activity into a timeline.
+/// PreToolUse stays synchronous because it also carries opt-in approval gating;
+/// all other recorders run asynchronously so agent execution does not wait.
+const TRACE_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+    "InstructionsLoaded",
+    "Stop",
+    "StopFailure",
+    "PreCompact",
+    "PostCompact",
+    "ConfigChange",
+    "Notification",
+    "SessionEnd",
+];
 
 pub fn base_dir() -> PathBuf {
     // Tests set IRIS_BASE_DIR to an isolated temp dir so they never touch the
@@ -38,6 +63,10 @@ pub fn base_dir() -> PathBuf {
         .unwrap_or_default()
         .join(".claude")
         .join("iris")
+}
+
+pub fn trace_db_path() -> PathBuf {
+    base_dir().join("traces.db")
 }
 fn requests_dir() -> PathBuf {
     base_dir().join("requests")
@@ -264,13 +293,26 @@ fn iris_live() -> bool {
         .unwrap_or(false)
 }
 
-/// Entry point for `iris hook`. Reads the PreToolUse payload on stdin and
-/// prints the decision JSON. Always exits 0 (a non-zero/garbage exit would
-/// block the tool); on any problem it defers to the normal prompt with "ask".
+/// Entry point for `iris hook`. Records lifecycle events and, for PreToolUse,
+/// preserves the approval bridge behavior. Always exits 0 so telemetry cannot
+/// block Claude Code; on any approval problem it defers to normal permissions.
 pub fn run_hook() -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+
+    let event_name = v
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("PreToolUse");
+    if event_name != "PreToolUse" {
+        if let Err(error) =
+            TraceStore::open(trace_db_path()).and_then(|mut store| store.ingest_hook(&v))
+        {
+            log(&format!("trace capture failed: {error}"));
+        }
+        return 0;
+    }
 
     let session_id = v["session_id"].as_str().unwrap_or("");
     let tool_name = v["tool_name"].as_str().unwrap_or("tool");
@@ -296,6 +338,12 @@ pub fn run_hook() -> i32 {
     if !gating_armed() {
         log("hook: gating disarmed → defer to normal permission flow");
         return 0;
+    }
+
+    if let Err(error) =
+        TraceStore::open(trace_db_path()).and_then(|mut store| store.ingest_hook(&v))
+    {
+        log(&format!("trace capture failed: {error}"));
     }
 
     ensure_dirs();
@@ -365,7 +413,7 @@ fn is_iris_hook(cmd: &str) -> bool {
     cmd.contains("iris") && cmd.trim_end().ends_with("hook")
 }
 
-/// Remove any `iris … hook` PreToolUse entry from settings.json (idempotent).
+/// Remove iris lifecycle hooks from settings.json (idempotent).
 pub fn uninstall_hook(project: bool) -> Result<String, String> {
     let path = settings_path(project)?;
     let text = match std::fs::read_to_string(&path) {
@@ -374,30 +422,30 @@ pub fn uninstall_hook(project: bool) -> Result<String, String> {
     };
     let mut root: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let mut removed = 0usize;
-    if let Some(arr) = root
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut("PreToolUse"))
-        .and_then(Value::as_array_mut)
-    {
-        for entry in arr.iter_mut() {
-            if let Some(hs) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
-                let before = hs.len();
-                hs.retain(|h| {
-                    !h.get("command")
-                        .and_then(Value::as_str)
-                        .map(is_iris_hook)
-                        .unwrap_or(false)
+    if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
+        for event in TRACE_HOOK_EVENTS {
+            if let Some(arr) = hooks.get_mut(*event).and_then(Value::as_array_mut) {
+                for entry in arr.iter_mut() {
+                    if let Some(hs) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+                        let before = hs.len();
+                        hs.retain(|h| {
+                            !h.get("command")
+                                .and_then(Value::as_str)
+                                .map(is_iris_hook)
+                                .unwrap_or(false)
+                        });
+                        removed += before - hs.len();
+                    }
+                }
+                arr.retain(|entry| {
+                    entry
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .map(|hooks| !hooks.is_empty())
+                        .unwrap_or(true)
                 });
-                removed += before - hs.len();
             }
         }
-        // Drop matcher entries left with no hooks.
-        arr.retain(|e| {
-            e.get("hooks")
-                .and_then(Value::as_array)
-                .map(|h| !h.is_empty())
-                .unwrap_or(true)
-        });
     }
     if removed == 0 {
         return Ok(format!("no iris hook found in {}", path.display()));
@@ -410,7 +458,7 @@ pub fn uninstall_hook(project: bool) -> Result<String, String> {
     ))
 }
 
-/// Register `iris hook` as a PreToolUse hook in settings.json (idempotent).
+/// Register iris lifecycle hooks in settings.json (idempotent).
 /// `project` targets `./.claude/settings.json` instead of the global one.
 pub fn install_hook(project: bool) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -431,42 +479,54 @@ pub fn install_hook(project: bool) -> Result<String, String> {
         .unwrap()
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let pre = hooks
-        .as_object_mut()
-        .ok_or("hooks is not an object")?
-        .entry("PreToolUse")
-        .or_insert_with(|| json!([]));
-    let arr = pre
-        .as_array_mut()
-        .ok_or("hooks.PreToolUse is not an array")?;
-
-    // Already installed?
-    let installed = arr.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(Value::as_array)
-            .map(|hs| {
-                hs.iter()
-                    .any(|h| h.get("command").and_then(Value::as_str) == Some(command.as_str()))
-            })
-            .unwrap_or(false)
-    });
-    if installed {
-        return Ok(format!("already installed in {}", settings_path.display()));
+    let hooks = hooks.as_object_mut().ok_or("hooks is not an object")?;
+    let mut added = 0usize;
+    for event in TRACE_HOOK_EVENTS {
+        let entries = hooks
+            .entry((*event).to_string())
+            .or_insert_with(|| json!([]));
+        let entries = entries
+            .as_array_mut()
+            .ok_or_else(|| format!("hooks.{event} is not an array"))?;
+        let installed = entries.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|registered| {
+                    registered.iter().any(|hook| {
+                        hook.get("command").and_then(Value::as_str) == Some(command.as_str())
+                    })
+                })
+        });
+        if !installed {
+            let hook = if *event == "PreToolUse" {
+                json!({ "type": "command", "command": command, "timeout": 30 })
+            } else {
+                json!({ "type": "command", "command": command, "async": true })
+            };
+            let entry = if matches!(*event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure") {
+                json!({ "matcher": "*", "hooks": [hook] })
+            } else {
+                json!({ "hooks": [hook] })
+            };
+            entries.push(entry);
+            added += 1;
+        }
     }
-
-    arr.push(json!({
-        "matcher": "*",
-        "hooks": [{ "type": "command", "command": command, "timeout": 30 }],
-    }));
 
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(&settings_path, out).map_err(|e| e.to_string())?;
+    let outcome = if added == 0 {
+        "already installed"
+    } else {
+        "installed"
+    };
     Ok(format!(
-        "installed PreToolUse hook in {}\ncommand: {command}\nRestart Claude Code sessions to pick it up.",
+        "{outcome} {} Iris capture hooks in {}\ncommand: {command}\nRestart Claude Code sessions to pick them up.",
+        TRACE_HOOK_EVENTS.len(),
         settings_path.display()
     ))
 }
@@ -512,6 +572,7 @@ fn tool_brief(name: &str, input: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -523,6 +584,18 @@ mod tests {
 
     fn fs_lock() -> std::sync::MutexGuard<'static, ()> {
         FS_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    struct HomeGuard(Option<OsString>);
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(home) = self.0.take() {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 
     /// Point iris at a fresh, empty temp dir for the duration of a test. The
@@ -657,5 +730,62 @@ mod tests {
         assert!(is_iris_hook("iris hook"));
         assert!(!is_iris_hook("iris ls"));
         assert!(!is_iris_hook("some-other-tool hook"));
+    }
+
+    #[test]
+    fn hook_installation_is_idempotent_and_uninstall_preserves_other_hooks() {
+        let _guard = fs_lock();
+        let home = TempDir::new().unwrap();
+        let _home_guard = HomeGuard(std::env::var_os("HOME"));
+        std::env::set_var("HOME", home.path());
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"other-recorder"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert!(install_hook(false).unwrap().starts_with("installed"));
+        let installed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        for event in TRACE_HOOK_EVENTS {
+            let entries = installed["hooks"][*event].as_array().unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+                    .filter(|hook| hook["command"].as_str().is_some_and(is_iris_hook))
+                    .count(),
+                1,
+                "exactly one Iris hook should be installed for {event}"
+            );
+        }
+        assert_eq!(
+            installed["hooks"]["PostToolUse"][1]["hooks"][0]["async"],
+            true
+        );
+        assert!(install_hook(false)
+            .unwrap()
+            .starts_with("already installed"));
+        assert!(uninstall_hook(false).unwrap().starts_with("removed"));
+
+        let uninstalled: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            uninstalled["hooks"]["PostToolUse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            uninstalled["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "other-recorder"
+        );
+        assert!(uninstalled["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }
