@@ -59,6 +59,13 @@ pub struct Event {
     pub text: String,
 }
 
+#[derive(Clone)]
+pub struct TranscriptRecord {
+    pub path: PathBuf,
+    pub offset: u64,
+    pub value: Value,
+}
+
 /// What a session is doing right now, derived from its transcript tail.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -116,6 +123,8 @@ pub struct Session {
     // tail bookkeeping
     offset: u64,
     pending: String,
+    pending_offset: u64,
+    new_records: Vec<TranscriptRecord>,
 }
 
 impl Session {
@@ -145,6 +154,8 @@ impl Session {
             live_request: false,
             offset: 0,
             pending: String::new(),
+            pending_offset: 0,
+            new_records: Vec::new(),
         }
     }
 
@@ -271,28 +282,49 @@ impl Session {
             // File was truncated or rotated — re-read from the top.
             self.offset = 0;
             self.pending.clear();
+            self.pending_offset = 0;
         }
         if len == self.offset {
             return Ok(false);
         }
 
+        let read_from = self.offset;
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         f.take(len - self.offset).read_to_end(&mut bytes)?;
         self.offset = len;
+        if self.pending.is_empty() {
+            self.pending_offset = read_from;
+        }
         self.pending.push_str(&String::from_utf8_lossy(&bytes));
 
         while let Some(idx) = self.pending.find('\n') {
             let line: String = self.pending.drain(..=idx).collect();
+            let record_offset = self.pending_offset;
+            self.pending_offset += line.len() as u64;
             let line = line.trim();
             if !line.is_empty() {
                 if let Ok(v) = serde_json::from_str::<Value>(line) {
                     self.process(&v);
+                    self.new_records.push(TranscriptRecord {
+                        path: self.path.clone(),
+                        offset: record_offset,
+                        value: v,
+                    });
                 }
             }
         }
         Ok(true)
+    }
+
+    pub fn take_new_records(&mut self) -> Vec<TranscriptRecord> {
+        std::mem::take(&mut self.new_records)
+    }
+
+    pub fn restore_new_records(&mut self, mut records: Vec<TranscriptRecord>) {
+        records.append(&mut self.new_records);
+        self.new_records = records;
     }
 
     fn process(&mut self, v: &Value) {
@@ -763,6 +795,39 @@ mod tests {
             "completed line parses on the next refresh"
         );
         assert_eq!(s.first_prompt.as_deref(), Some("split prompt"));
+    }
+
+    #[test]
+    fn captured_records_keep_byte_offsets_across_partial_writes() {
+        let dir = TempDir::new().unwrap();
+        let mut s = session_with(&dir, &[]);
+        let first = r#"{"type":"user","message":{"content":"first"}}"#;
+        let split = first.len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s.path)
+            .unwrap();
+        file.write_all(&first.as_bytes()[..split]).unwrap();
+        drop(file);
+        s.refresh().unwrap();
+        assert!(s.take_new_records().is_empty());
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s.path)
+            .unwrap();
+        file.write_all(&first.as_bytes()[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        s.refresh().unwrap();
+        let first_record = s.take_new_records().pop().unwrap();
+        assert_eq!(first_record.offset, 0);
+
+        let second = r#"{"type":"user","message":{"content":"second"}}"#;
+        append(&s, &[second]);
+        s.refresh().unwrap();
+        let second_record = s.take_new_records().pop().unwrap();
+        assert_eq!(second_record.offset, (first.len() + 1) as u64);
     }
 
     #[test]

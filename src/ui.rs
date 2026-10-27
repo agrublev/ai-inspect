@@ -9,8 +9,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use serde_json::Value;
 
-use crate::app::{App, GroupInfo, Row, SummaryState};
+use crate::app::{App, GroupInfo, Row, SummaryState, TracePane};
 use crate::cost;
 use crate::session::{Event, EventKind, Session, Status};
 
@@ -93,6 +94,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.install_open {
         draw_install_popup(f, app);
     }
+    if app.trace_browser_open {
+        draw_trace_browser(f, app);
+    }
 }
 
 fn draw_install_popup(f: &mut Frame, app: &App) {
@@ -101,7 +105,7 @@ fn draw_install_popup(f: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" approvals ")
+        .title(" trace capture + approvals ")
         .border_style(Style::new().fg(Color::Cyan));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -115,17 +119,18 @@ fn draw_install_popup(f: &mut Frame, app: &App) {
         (
             vec![
                 Line::from(Span::styled(
-                    "Approval interception is ON.",
+                    "Trace capture hooks are installed.",
                     Style::new().fg(Color::Green).bold(),
                 )),
                 Line::from(""),
                 Line::from(
-                    "iris intercepts tool-approval prompts from your other Claude Code \
-                     sessions via a PreToolUse hook in ~/.claude/settings.json.",
+                    "Prompts, model responses, tool calls/results, and lifecycle events are \
+                     stored locally in ~/.claude/iris/traces.db (0600); nothing is uploaded. \
+                     Approval gating remains off unless you arm it with A.",
                 ),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Disable it (remove the hook)?",
+                    "Remove Iris capture and approval hooks?",
                     Style::new().fg(Color::DarkGray),
                 )),
             ],
@@ -140,19 +145,19 @@ fn draw_install_popup(f: &mut Frame, app: &App) {
         (
             vec![
                 Line::from(Span::styled(
-                    "Let iris approve tool calls from your other Claude sessions?",
+                    "Install local trace capture hooks for Claude Code?",
                     Style::new().fg(Color::Reset).bold(),
                 )),
                 Line::from(""),
                 Line::from(
-                    "This adds a PreToolUse hook to ~/.claude/settings.json. While iris \
-                     is running, each tool call from any session waits for your decision \
-                     here (a allow / d deny); if iris isn't running it falls back to the \
-                     normal prompt. You'll need to restart sessions to arm it.",
+                    "Iris records prompts, model output, tool inputs/results, skills, and \
+                     subagent lifecycle locally in ~/.claude/iris/traces.db (0600). No data \
+                     leaves this machine. The approval hook is also installed, but it only \
+                     intercepts calls after you arm gating with A. Restart sessions to apply.",
                 ),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enable approval interception?",
+                    "Enable local capture? (Approval gating stays opt-in.)",
                     Style::new().fg(Color::DarkGray),
                 )),
             ],
@@ -166,6 +171,270 @@ fn draw_install_popup(f: &mut Frame, app: &App) {
     };
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
     f.render_widget(Paragraph::new(hint), rows[1]);
+}
+
+fn draw_trace_browser(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let count = app.trace_rows.len();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " trace explorer · {count} {} ",
+            if count == 1 { "trace" } else { "traces" }
+        ))
+        .border_style(Style::new().fg(PRIMARY));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(rows[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(columns[1]);
+
+    let trace_border = if app.trace_pane == TracePane::Traces {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let trace_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " {}traces · newest first ",
+            if app.trace_pane == TracePane::Traces {
+                "▶ "
+            } else {
+                ""
+            }
+        ))
+        .border_style(Style::new().fg(trace_border));
+    if app.trace_rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("No traces yet. Install capture hooks or run `iris traces` to import existing transcripts.")
+                .wrap(Wrap { trim: false })
+                .block(trace_block),
+            columns[0],
+        );
+    } else {
+        let items = app
+            .trace_rows
+            .iter()
+            .map(|trace| {
+                let timestamp = trace["started_at"].as_str().unwrap_or("unknown time");
+                let status = trace["status"].as_str().unwrap_or("unknown");
+                let count = trace["event_count"].as_u64().unwrap_or(0);
+                let input_max = (columns[0].width as usize).saturating_sub(16).max(8);
+                let input = short_trace_value(&trace["input"], input_max);
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} ", trace_state_glyph(status)),
+                            Style::new().fg(trace_state_color(status)),
+                        ),
+                        Span::styled(
+                            timestamp.chars().take(19).collect::<String>(),
+                            Style::new().fg(Color::Reset),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{count:>3} events  "),
+                            Style::new().fg(Color::DarkGray),
+                        ),
+                        Span::styled(input, Style::new().fg(Color::Reset)),
+                    ]),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(items)
+            .block(trace_block)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+        let mut state = ListState::default();
+        state.select(Some(app.trace_selected));
+        f.render_stateful_widget(list, columns[0], &mut state);
+    }
+
+    let event_border = if app.trace_pane == TracePane::Events {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let trace_id = app
+        .trace_rows
+        .get(app.trace_selected)
+        .and_then(|trace| trace["trace_id"].as_str())
+        .unwrap_or("select a trace");
+    let event_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " {}timeline · {} events · {} ",
+            if app.trace_pane == TracePane::Events {
+                "▶ "
+            } else {
+                ""
+            },
+            app.trace_events.len(),
+            short_text(trace_id, 12)
+        ))
+        .border_style(Style::new().fg(event_border));
+    if app.trace_events.is_empty() {
+        f.render_widget(
+            Paragraph::new("Select a trace to inspect its event timeline.")
+                .style(Style::new().fg(Color::DarkGray))
+                .block(event_block),
+            right[0],
+        );
+    } else {
+        let items = app
+            .trace_events
+            .iter()
+            .map(|event| {
+                let timestamp = event["timestamp"].as_str().unwrap_or("?");
+                let kind = event["event_type"].as_str().unwrap_or("event");
+                let name = event["name"].as_str().unwrap_or("");
+                let status = event["status"].as_str().unwrap_or("?");
+                let name_max = (right[0].width as usize).saturating_sub(40).clamp(8, 24);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", clock_time(timestamp)),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{:<16}", short_text(kind, 16)),
+                        Style::new().fg(Color::Cyan),
+                    ),
+                    Span::styled(short_text(name, name_max), Style::new().fg(Color::Reset)),
+                    Span::styled(
+                        format!(" [{status}]"),
+                        Style::new().fg(trace_state_color(status)),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(items)
+            .block(event_block)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+        let mut state = ListState::default();
+        state.select(Some(app.trace_event_selected));
+        f.render_stateful_widget(list, right[0], &mut state);
+    }
+
+    let payload_border = if app.trace_pane == TracePane::Payload {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let payload_title = app
+        .selected_trace_event()
+        .and_then(|event| event["event_type"].as_str())
+        .unwrap_or("event payload");
+    let payload = app
+        .selected_trace_event()
+        .and_then(|event| serde_json::to_string_pretty(event).ok())
+        .unwrap_or_else(|| "No event selected.".to_string());
+    let payload_width = right[1].width.saturating_sub(2).max(1);
+    let payload_height = right[1].height.saturating_sub(2);
+    let payload_lines = wrapped_line_count(&payload, payload_width);
+    let max_scroll = payload_lines
+        .saturating_sub(payload_height as usize)
+        .min(u16::MAX as usize) as u16;
+    app.set_trace_payload_max_scroll(max_scroll);
+    f.render_widget(
+        Paragraph::new(payload)
+            .scroll((app.trace_payload_scroll(), 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(
+                        " {}payload · {} ",
+                        if app.trace_pane == TracePane::Payload {
+                            "▶ "
+                        } else {
+                            ""
+                        },
+                        short_text(payload_title, 26)
+                    ))
+                    .border_style(Style::new().fg(payload_border)),
+            ),
+        right[1],
+    );
+
+    let hint = Line::from(vec![
+        Span::styled(" Tab ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(" pane   ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" j/k ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(" move   ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" Enter ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(" next   ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" r ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(" refresh   ", Style::new().fg(Color::DarkGray)),
+        Span::styled(" Esc/q ", Style::new().fg(Color::Black).bg(Color::DarkGray)),
+        Span::styled(" close", Style::new().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(hint), rows[1]);
+}
+
+fn trace_state_glyph(status: &str) -> &'static str {
+    match status {
+        "running" => "●",
+        "error" | "failed" => "✗",
+        "ok" | "complete" => "✓",
+        _ => "○",
+    }
+}
+
+fn trace_state_color(status: &str) -> Color {
+    match status {
+        "running" => Color::Yellow,
+        "error" | "failed" => Color::Red,
+        "ok" | "complete" => Color::Green,
+        _ => Color::DarkGray,
+    }
+}
+
+fn short_trace_value(value: &Value, max: usize) -> String {
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+        .replace('\n', " ");
+    short_text(&text, max)
+}
+
+fn short_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars()
+            .take(max.saturating_sub(1))
+            .chain(['…'])
+            .collect()
+    }
+}
+
+fn clock_time(timestamp: &str) -> &str {
+    timestamp
+        .split_once('T')
+        .map(|(_, time)| time.get(..8).unwrap_or(time))
+        .unwrap_or_else(|| timestamp.get(..8).unwrap_or(timestamp))
+}
+
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    text.lines()
+        .map(|line| Line::from(line).width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn draw_approval_popup(f: &mut Frame, app: &App) {
@@ -211,14 +480,18 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
         Some(SummaryState::Error(e)) => {
             Paragraph::new(format!("risk check failed: {e}")).style(Style::new().fg(Color::Red))
         }
-        None => Paragraph::new("press x for an AI risk read")
-            .style(Style::new().fg(Color::DarkGray)),
+        None => {
+            Paragraph::new("press x for an AI risk read").style(Style::new().fg(Color::DarkGray))
+        }
     };
     let assess_block = Block::default()
         .borders(Borders::ALL)
         .title(" risk ")
         .border_style(Style::new().fg(Color::DarkGray));
-    f.render_widget(assess.block(assess_block).wrap(Wrap { trim: false }), rows[1]);
+    f.render_widget(
+        assess.block(assess_block).wrap(Wrap { trim: false }),
+        rows[1],
+    );
 
     let input_block = Block::default()
         .borders(Borders::TOP)
@@ -374,7 +647,10 @@ fn summary_lines(text: &str) -> Vec<Line<'static>> {
                 Span::styled(format!("{icon} "), Style::new().fg(hcolor).bold()),
                 Span::styled(
                     label.to_uppercase(),
-                    Style::new().fg(hcolor).bold().add_modifier(Modifier::UNDERLINED),
+                    Style::new()
+                        .fg(hcolor)
+                        .bold()
+                        .add_modifier(Modifier::UNDERLINED),
                 ),
             ];
             if !rest.is_empty() {
@@ -386,7 +662,13 @@ fn summary_lines(text: &str) -> Vec<Line<'static>> {
             let style = cur.unwrap_or_else(|| Style::new().fg(Color::Reset));
             lines.push(Line::from(vec![
                 Span::styled("   • ", Style::new().fg(Color::DarkGray)),
-                Span::styled(trimmed.trim_start_matches(['-', '•', '*']).trim().to_string(), style),
+                Span::styled(
+                    trimmed
+                        .trim_start_matches(['-', '•', '*'])
+                        .trim()
+                        .to_string(),
+                    style,
+                ),
             ]));
         }
     }
@@ -530,9 +812,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 
     // Reverse-video highlight adapts to any terminal theme (light or dark)
     // instead of a fixed dark bar that vanishes on a light background.
-    let list = List::new(items).block(block).highlight_style(
-        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-    );
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
 
     let mut state = ListState::default();
     state.select(Some(app.selected));
@@ -572,19 +854,30 @@ fn group_item(g: &GroupInfo) -> ListItem<'static> {
         ));
     }
     if g.working > 0 {
-        counts.push(Span::styled(format!("●{} ", g.working), Style::new().fg(Color::Green)));
+        counts.push(Span::styled(
+            format!("●{} ", g.working),
+            Style::new().fg(Color::Green),
+        ));
     }
     if g.done > 0 {
-        counts.push(Span::styled(format!("✓{} ", g.done), Style::new().fg(Color::Blue)));
+        counts.push(Span::styled(
+            format!("✓{} ", g.done),
+            Style::new().fg(Color::Blue),
+        ));
     }
     if g.idle > 0 {
-        counts.push(Span::styled(format!("○{}", g.idle), Style::new().fg(Color::DarkGray)));
+        counts.push(Span::styled(
+            format!("○{}", g.idle),
+            Style::new().fg(Color::DarkGray),
+        ));
     }
     spans.extend(counts);
     if g.collapsed && !g.lead_label.is_empty() {
         spans.push(Span::styled(
             format!("  {}", g.lead_label),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     ListItem::new(Line::from(spans))
@@ -605,7 +898,10 @@ fn session_item(app: &App, s: &Session, grouped: bool) -> ListItem<'static> {
     ];
     // For ungrouped (singleton) rows, show the project for context.
     if !grouped {
-        spans.push(Span::styled(format!(" · {}", s.project()), Style::new().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            format!(" · {}", s.project()),
+            Style::new().fg(Color::Cyan),
+        ));
     }
     spans.push(Span::styled(
         format!(" · {}", short_model(s.model.as_deref())),
@@ -764,14 +1060,28 @@ fn draw_group_detail(f: &mut Frame, app: &App, g: &GroupInfo, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled(format!("⚠ {} pending   ", g.pending), Style::new().fg(Color::Red).bold()),
-            Span::styled(format!("● {} working   ", g.working), Style::new().fg(Color::Green)),
-            Span::styled(format!("✓ {} done   ", g.done), Style::new().fg(Color::Blue)),
-            Span::styled(format!("○ {} idle", g.idle), Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("⚠ {} pending   ", g.pending),
+                Style::new().fg(Color::Red).bold(),
+            ),
+            Span::styled(
+                format!("● {} working   ", g.working),
+                Style::new().fg(Color::Green),
+            ),
+            Span::styled(
+                format!("✓ {} done   ", g.done),
+                Style::new().fg(Color::Blue),
+            ),
+            Span::styled(
+                format!("○ {} idle", g.idle),
+                Style::new().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(Span::styled(
             "⏎/␣ fold/unfold   a/d approve/deny all pending in group",
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )),
     ];
     f.render_widget(Paragraph::new(head), rows[0]);
@@ -819,7 +1129,9 @@ fn draw_tools(f: &mut Frame, s: &Session, area: Rect) {
 
     let mut lines = vec![Line::from(Span::styled(
         "tool calls",
-        Style::new().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED),
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::UNDERLINED),
     ))];
     for (name, n) in pairs.into_iter().take(6) {
         let width = 18usize;
@@ -847,7 +1159,11 @@ fn draw_feed(f: &mut Frame, app: &App, s: &Session, area: Rect) {
     } else {
         " activity ".to_string()
     };
-    let border = if app.focused { Color::Cyan } else { Color::DarkGray };
+    let border = if app.focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let block = Block::default()
         .borders(Borders::TOP)
         .title(title)
@@ -861,7 +1177,11 @@ fn draw_feed(f: &mut Frame, app: &App, s: &Session, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = s.events.iter().map(|e| ListItem::new(event_line(e))).collect();
+    let items: Vec<ListItem> = s
+        .events
+        .iter()
+        .map(|e| ListItem::new(event_line(e)))
+        .collect();
     let mut list = List::new(items);
     // A reverse-video current line gives the vim "cursor" feel while entered.
     if app.focused {
@@ -882,10 +1202,9 @@ fn draw_feed(f: &mut Frame, app: &App, s: &Session, area: Rect) {
 }
 
 fn event_line(e: &Event) -> Line<'static> {
-    let ts = e
-        .ts
-        .map(|t| t.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "--:--:--".into());
+    let ts =
+        e.ts.map(|t| t.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "--:--:--".into());
     // Each action gets its own icon, accent color, and — crucially — its own
     // text typography, so the feed reads at a glance: your prompts are bold,
     // Claude's thinking is dim italic, tool commands are italic, results are
@@ -940,7 +1259,10 @@ fn event_line(e: &Event) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{ts} "), Style::new().fg(Color::DarkGray)),
         Span::styled(format!("{icon} "), Style::new().fg(color)),
-        Span::styled(format!("{label} "), Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{label} "),
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(e.text.clone(), text),
     ])
 }
@@ -952,27 +1274,49 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // In scroll mode the keys are repurposed for navigating the feed.
     let line = if app.focused {
         Line::from(vec![
-            chip(" j/k "), txt(" scroll  "),
-            chip(" g/G "), txt(" top/bottom  "),
-            chip(" PgUp/PgDn "), txt(" page  "),
-            chip(" s "), txt(" summary  "),
-            chip(" a/d "), txt(" allow/deny  "),
-            chip(" Esc/h "), txt(" back  "),
-            chip(" q "), txt(" quit"),
+            chip(" j/k "),
+            txt(" scroll  "),
+            chip(" g/G "),
+            txt(" top/bottom  "),
+            chip(" PgUp/PgDn "),
+            txt(" page  "),
+            chip(" s "),
+            txt(" summary  "),
+            chip(" t "),
+            txt(" traces  "),
+            chip(" a/d "),
+            txt(" allow/deny  "),
+            chip(" Esc/h "),
+            txt(" back  "),
+            chip(" q "),
+            txt(" quit"),
         ])
     } else {
         Line::from(vec![
-            chip(" j/k "), txt(" move  "),
-            chip(" ⏎/l "), txt(" enter  "),
-            chip(" ␣ "), txt(" fold  "),
-            chip(" z "), txt(" fold all  "),
-            chip(" a/d "), txt(" allow/deny  "),
-            chip(" D "), txt(" delete  "),
-            chip(" A "), txt(" arm gating  "),
-            chip(" s "), txt(" summary  "),
-            chip(" i "), txt(" approvals  "),
-            chip(" K "), txt(" key  "),
-            chip(" q "), txt(" quit"),
+            chip(" j/k "),
+            txt(" move  "),
+            chip(" ⏎/l "),
+            txt(" enter  "),
+            chip(" ␣ "),
+            txt(" fold  "),
+            chip(" z "),
+            txt(" fold all  "),
+            chip(" a/d "),
+            txt(" allow/deny  "),
+            chip(" D "),
+            txt(" delete  "),
+            chip(" A "),
+            txt(" gate  "),
+            chip(" s "),
+            txt(" summary  "),
+            chip(" i "),
+            txt(" hooks  "),
+            chip(" K "),
+            txt(" key  "),
+            chip(" t "),
+            txt(" traces  "),
+            chip(" q "),
+            txt(" quit"),
         ])
     };
     f.render_widget(Paragraph::new(line), area);

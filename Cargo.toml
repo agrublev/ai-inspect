@@ -4,7 +4,7 @@
 name = "iris-tui"
 version = "0.2.0"
 edition = "2021"
-description = "Live supervisor TUI for all active Claude Code sessions"
+description = "Local-first Claude Code session supervisor and AI trace explorer"
 license = "MIT"
 repository = "https://github.com/itzenata/iris-tui"
 homepage = "https://itzenata.github.io/iris-tui/"
@@ -21,10 +21,12 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"
 chrono = "0.4"
 dirs = "5"
 ureq = "2"
+tiny_http = "0.12"
 
 [dev-dependencies]
 # Test-only: auto-cleaning temp dirs so tests never touch ~/.claude/iris.

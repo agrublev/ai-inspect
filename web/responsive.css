@@ -1,0 +1,25 @@
+@media (max-width: 700px) {
+  .explorer-layout { min-height: 0; }
+  .trace-panel { min-height: 0; }
+  .table-wrap { min-height: 210px; }
+  .trace-table th:first-child, .trace-table td:first-child { width: 57%; }
+  .trace-table th:nth-child(2), .trace-table td:nth-child(2) { width: 28%; }
+  .trace-table th:nth-child(3), .trace-table td:nth-child(3) { width: 15%; }
+  .trace-table th:nth-child(4), .trace-table td:nth-child(4) { display: none; }
+  .detail-title-row > div { flex: 1; min-width: 0; }
+  .detail-title-row h2 { max-width: 100%; }
+  .detail-title-row > .status-pill { flex-shrink: 0; margin-left: 8px; }
+}
+
+@media (max-width: 700px) {
+  .nav-item:not(.active) { display: flex; }
+  .library-layout { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .library-list-panel { min-height: 360px; }
+  .library-detail-panel { max-height: none; min-height: 420px; }
+  .dataset-values { grid-template-columns: minmax(0, 1fr); }
+  .library-detail-header { padding: 14px 13px 12px; }
+  .library-detail-body { padding: 11px 10px 14px; }
+  .editor-dialog { max-width: calc(100vw - 20px); }
+  .editor-dialog form { gap: 12px; padding: 16px; }
+  .editor-field textarea.prompt-input { min-height: 160px; }
+}

@@ -17,12 +17,27 @@ pub struct Pricing {
 pub fn pricing_for(model: Option<&str>) -> Pricing {
     let m = model.unwrap_or("").to_lowercase();
     if m.contains("haiku") {
-        Pricing { input: 0.80, output: 4.0, cache_write: 1.0, cache_read: 0.08 }
+        Pricing {
+            input: 0.80,
+            output: 4.0,
+            cache_write: 1.0,
+            cache_read: 0.08,
+        }
     } else if m.contains("sonnet") {
-        Pricing { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 }
+        Pricing {
+            input: 3.0,
+            output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
+        }
     } else {
         // opus / fable / unknown -> opus-tier estimate
-        Pricing { input: 15.0, output: 75.0, cache_write: 18.75, cache_read: 1.50 }
+        Pricing {
+            input: 15.0,
+            output: 75.0,
+            cache_write: 18.75,
+            cache_read: 1.50,
+        }
     }
 }
 
@@ -41,7 +56,12 @@ mod tests {
     use super::*;
 
     fn usage(input: u64, output: u64, cache_creation: u64, cache_read: u64) -> Usage {
-        Usage { input, output, cache_creation, cache_read }
+        Usage {
+            input,
+            output,
+            cache_creation,
+            cache_read,
+        }
     }
 
     #[test]

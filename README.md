@@ -1,6 +1,6 @@
 # iris
 
-> A live terminal supervisor for every active Claude Code session. **`cargo install iris-tui`** (the binary is `iris`).
+> Local-first observability for Claude Code: a live terminal supervisor and an interactive trace explorer. **`cargo install iris-tui`** (the binary is `iris`).
 
 [![crates.io](https://img.shields.io/crates/v/iris-tui?logo=rust&color=e6b800)](https://crates.io/crates/iris-tui)
 [![CI](https://img.shields.io/github/actions/workflow/status/itzenata/iris-tui/ci.yml?branch=main&label=CI)](https://github.com/itzenata/iris-tui/actions/workflows/ci.yml)
@@ -16,7 +16,7 @@
 
 A fast terminal dashboard that watches **all your running Claude Code sessions at once**: what each one is doing right now, its model, tokens and estimated cost, an AI "doing / done / next" summary, and one-key approval of pending tool calls routed from any session into a single pane.
 
-It reads the transcripts Claude Code already writes under `~/.claude/projects/`. **No daemon, no config, nothing to set up** beyond an optional approval hook.
+It reads the transcripts Claude Code already writes under `~/.claude/projects/`. **No daemon** is required; install the optional Claude Code hooks to capture lifecycle events and tool boundaries.
 
 **Hard rules:** local-first (the only network call is the AI summary you opt into), read-only over your transcripts, and a heartbeat so sessions never hang waiting on iris.
 
@@ -41,6 +41,32 @@ A single live pane, refreshed every second:
 
 **Remote approvals:** `iris install-hook` registers a `PreToolUse` hook in `settings.json`. With gating armed (`A`), any session's permission prompt routes into iris: approve or deny it, for one session or a whole group, from one place.
 
+**Trace history:** the hooks capture supported prompt, model, tool, instruction, task, and subagent lifecycle events. Transcript events are also normalized into per-turn traces and correlated tool spans. Everything stays in the local SQLite store at `~/.claude/iris/traces.db` (owner-only directory and 0600 database); nothing is uploaded. The full prompts and tool payloads may contain sensitive data, so protect or remove this file as you would the Claude transcripts.
+
+Press `t` in the live TUI to browse recent traces, their chronological event timelines, and each event's full JSON payload. `Tab` changes panes; `j`/`k` move through traces and events or scroll the payload.
+
+For a browser-based explorer with a searchable trace table, status and event filters, run summaries, span hierarchy, event payloads, and evaluation scores, run `iris web` and open the local address it prints (`http://127.0.0.1:4318`). The Datasets page can create datasets, rename them, edit descriptions and examples, and add expected outputs. Prompts can be created and revised as immutable versions; older versions remain unchanged. The CLI workflows below remain available. The server imports existing transcripts on startup and refreshes captured hook data every five seconds. It binds to loopback only; the page and assets are served locally with no external fonts, analytics, or telemetry. Prompts, tool payloads, and templates are sensitive, so do not expose the local server beyond a trusted tunnel.
+
+```bash
+iris traces                               # recent turns, newest first
+iris trace <trace-id-prefix>              # full event timeline and payloads
+iris search "tool input or result text"   # search captured event data
+iris web                                  # local browser-based trace explorer
+```
+
+**Local evaluation and prompt versions:** manage JSON datasets, add expected outputs, run exact/contains checks against completed traces, add manual quality scores, and keep immutable prompt versions. These commands do not call an LLM or send data over the network:
+
+```bash
+iris dataset create smoke "smoke-test examples"
+iris dataset add smoke '"hello"' '"hi"'
+iris eval run smoke exact
+iris evals
+iris prompt save greeting "Answer briefly: {{input}}"
+iris prompt list
+```
+
+Dataset evaluation scores existing captured traces; it does not launch agent runs. Prompt versions are stored for review/use by local workflows; automatic prompt optimization and online LLM-as-judge evaluation are not implemented.
+
 **Cost model:** per-model pricing (input / output / cache-write / cache-read) kept as editable constants in [`src/cost.rs`](./src/cost.rs). Figures are estimates; adjust them to your plan.
 
 ## Hard rules
@@ -64,8 +90,10 @@ Then:
 ```bash
 iris                     # live dashboard
 iris ls                  # one-shot table, no TUI
-iris install-hook        # route approvals through iris (--project for ./.claude)
-iris uninstall-hook      # remove the hook
+iris install-hook        # capture lifecycle events; approval gating remains opt-in
+iris uninstall-hook      # remove Iris lifecycle hooks
+iris traces               # inspect local trace history
+iris web                  # open the local trace explorer
 ```
 
 Single static binary, built with Rust + [ratatui](https://ratatui.rs). Reads `~/.claude/projects/`; override with `-d <path>`.
@@ -81,6 +109,7 @@ Single static binary, built with Rust + [ratatui](https://ratatui.rs). Reads `~/
 | `⏎` | open the approval detail (full input + AI risk read), or enter a session's feed |
 | `a` `d` | allow / deny the pending tool call (whole group when a header is selected) |
 | `s` | AI summary of the selected session (`g` to regenerate) |
+| `t` | open the trace explorer (traces, event timeline, full payload) |
 | `x` | AI risk read of the pending tool call |
 | `i` | open the approval-interception proposal |
 | `A` | arm / disarm approval gating |
@@ -102,6 +131,7 @@ Single static binary, built with Rust + [ratatui](https://ratatui.rs). Reads `~/
 - [x] AI risk read on a pending tool call
 - [x] Heartbeat fallback so sessions never block on iris
 - [x] `ls` one-shot table mode
+- [x] Loopback web trace explorer with event filters, span hierarchy, and payload detail
 - [x] Remove sessions from the view (`D`) without touching transcripts
 - [x] Unit tests for the heartbeat and transcript parsing
 - [x] CI on every push and PR (clippy, build, test)
